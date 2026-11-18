@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest a change or a new function
+title: "Feature: "
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read ROADMAP.md first. The feature is possibly planned.
+        Quorix keeps its scope small. Read the section "Items that Quorix will not have".
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What can you not do today? Describe the situation, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives that you considered
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Command-line tool
+        - Transfer engine
+        - Desktop application
+        - Browser extension
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched the open and closed issues for this request.
+          required: true
+        - label: This request does not bypass copy protection.
+          required: true

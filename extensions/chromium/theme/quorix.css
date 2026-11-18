@@ -1,0 +1,159 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Quorix theme — single source of truth for every Quorix surface
+   (desktop app, website, browser extension). Edit here, then run
+   `node scripts/sync-theme.mjs` to copy it into each product.
+
+   Basis: Apple HIG (three shape types, concentric radii, grouped controls,
+   one tinted primary action, left-aligned type) and Material 3 Expressive
+   (size, shape, colour and containment lift the key action; connected button
+   groups; shape change on selection; wavy progress; emphasised type). */
+
+@font-face { font-family: "Poppins"; font-weight: 400; font-style: normal; font-display: swap; src: url("fonts/poppins-400.woff2") format("woff2"); }
+@font-face { font-family: "Poppins"; font-weight: 500; font-style: normal; font-display: swap; src: url("fonts/poppins-500.woff2") format("woff2"); }
+@font-face { font-family: "Poppins"; font-weight: 600; font-style: normal; font-display: swap; src: url("fonts/poppins-600.woff2") format("woff2"); }
+
+:root {
+  color-scheme: light dark;
+  &:has(> head > meta[name="color-scheme"][content="dark"]) { color-scheme: dark; }
+  &:has(> head > meta[name="color-scheme"][content="light"]) { color-scheme: light; }
+
+  /* One neutral ramp. Surfaces stay grey; colour belongs to content. */
+  --desk:  light-dark(#ececed, #070708);
+  --side:  light-dark(#f4f4f5, #0f0f10);
+  --bg:    light-dark(#fafafa, #141415);
+  --card:  light-dark(#ffffff, #19191b);
+  --raise: light-dark(#f1f1f2, #232325);
+  --tx:    light-dark(#171717, #ededed);
+  --tx2:   light-dark(#525252, #a1a1a6);
+  --tx3:   light-dark(#737373, #85858b);
+  --hair:  light-dark(rgb(23 23 23 / .09), rgb(237 237 237 / .09));
+
+  /* One accent: signal vermilion. Dark text on it; darker shade when used as ink. */
+  --acc:      #ff5b2e;
+  --on-acc:   #1c0a04;
+  --acc-ink:  light-dark(#b8380f, #ff7d55);
+  --acc-soft: light-dark(#ffe7de, #3a1a10);
+
+  --ok:   light-dark(#15803d, #4cc38a);
+  --warn: light-dark(#9a5b00, #e0a84a);
+  --bad:  light-dark(#c62828, #f0655f);
+
+  /* Shape scale (fixed · capsule · concentric = outer − padding) */
+  --r-xs: 4px; --r-s: 8px; --r-m: 12px; --r-l: 16px; --r-xl: 24px; --r-2xl: 28px; --r-full: 1e5px;
+
+  --f: "Poppins", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --ease: cubic-bezier(.22, 1, .36, 1);
+}
+
+* { box-sizing: border-box; margin: 0; }
+body { font: 400 14px/20px var(--f); font-size-adjust: from-font; color: var(--tx); background: var(--bg); -webkit-font-smoothing: antialiased; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+ul { list-style: none; padding: 0; }
+svg { display: block; flex: none; }
+:focus-visible { outline: 2px solid var(--acc-ink); outline-offset: 2px; }
+.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+
+.win { max-width: 1360px; height: calc(100vh - 48px); min-height: 720px; margin: 0 auto; background: var(--bg);
+  border-radius: var(--r-xl); overflow: clip; box-shadow: 0 0 0 1px var(--hair), 0 24px 48px -24px rgb(0 0 0 / .25); }
+
+/* State tone: only a transfer in motion earns the accent. */
+[data-st] { --tone: var(--tx3); --tone-ink: var(--tx2); }
+[data-st=downloading] { --tone: var(--acc); --tone-ink: var(--acc-ink); }
+[data-st=verifying], [data-st=completed] { --tone: var(--ok); --tone-ink: var(--ok); }
+[data-st=retrying] { --tone: var(--warn); --tone-ink: var(--warn); }
+[data-st=failed] { --tone: var(--bad); --tone-ink: var(--bad); }
+
+/* Icon button */
+.ib { display: grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: var(--r-s); background: none; color: var(--tx2);
+  transition: background-color .15s var(--ease), color .15s var(--ease); }
+.ib:hover { background: var(--raise); color: var(--tx); }
+.ib:active { transform: scale(.96); }
+
+/* Labelled buttons */
+.btn { display: inline-flex; align-items: center; gap: 8px; height: 40px; padding: 0 20px; border: 0; border-radius: var(--r-full); font-weight: 500; white-space: nowrap;
+  transition: background-color .15s var(--ease), transform .15s var(--ease); }
+.btn:active { transform: scale(.98); }
+.btn.pri { background: var(--acc); color: var(--on-acc); }
+.btn.sec { background: var(--raise); color: var(--tx); }
+
+/* Native progress, custom drawn */
+progress { appearance: none; border: 0 solid; height: 4px; border-radius: var(--r-full); overflow: clip; background: var(--hair); }
+progress::-webkit-progress-bar { background: transparent; }
+progress::-webkit-progress-value { background: var(--tone); border-radius: var(--r-full); }
+progress::-moz-progress-bar { background: var(--tone); border-radius: var(--r-full); }
+
+/* Signature: the byte strip. One cell per slice of the file, grouped by the
+   worker that owns it. Solid = committed to disk, accent = in transfer. */
+#segs { display: flex; gap: 2px; height: 24px; }
+#segs i { flex: 1; border-radius: 3px; background: var(--hair); }
+#segs i.d { background: var(--tx); }
+#segs i.a { background: var(--acc); }
+#segs i.g { margin-left: 4px; }
+.legend { display: flex; gap: 16px; margin-top: 8px; font-size: 12px; line-height: 16px; color: var(--tx3); }
+.legend span { display: flex; align-items: center; gap: 6px; }
+.legend span::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--hair); }
+.legend .d::before { background: var(--tx); }
+.legend .a::before { background: var(--acc); }
+
+/* Detail pairs */
+.kv { display: grid; grid-template-columns: 104px minmax(0, 1fr); font-size: 13px; }
+.kv dt, .kv dd { padding: 10px 0; border-top: 1px solid var(--hair); }
+.kv dt { color: var(--tx3); }
+.kv dd { overflow-wrap: anywhere; }
+.kv dt:first-of-type, .kv dt:first-of-type + dd { border-top: 0; }
+
+/* Progress ring: native <progress>, drawn with a conic gradient and a mask. */
+progress.ring { --th: 14px; --v: 0; width: var(--size, 232px); height: var(--size, 232px); border-radius: 50%; overflow: visible;
+  background: conic-gradient(var(--tone) calc(var(--v) * 1%), var(--hair) 0);
+  mask-image: radial-gradient(farthest-side, transparent calc(100% - var(--th)), #000 calc(100% - var(--th) + .5px));
+  @media (forced-colors: active) { forced-color-adjust: none; --tone: CanvasText; --hair: Canvas; } }
+progress.ring::-webkit-progress-bar { display: none; }
+progress.ring::-webkit-progress-value { display: none; }
+progress.ring::-moz-progress-bar { background: none; }
+
+/* New download dialog (native modal) */
+dialog#new { width: min(560px, calc(100vw - 32px)); margin: auto; padding: 28px; border: 0; border-radius: var(--r-2xl); background: var(--card); color: var(--tx);
+  box-shadow: 0 0 0 1px var(--hair), 0 24px 64px rgb(0 0 0 / .3); }
+dialog:modal { overscroll-behavior: contain; }
+dialog::backdrop { background: rgb(0 0 0 / .4); overflow: hidden; overscroll-behavior: contain; }
+dialog#new form { display: grid; gap: 16px; }
+dialog#new h2 { font: 500 22px/28px var(--f); }
+.fld { display: grid; gap: 6px; font-size: 12px; line-height: 16px; color: var(--tx3); }
+.fld input, .fld select { height: 44px; padding: 0 14px; border: 1px solid var(--hair); border-radius: var(--r-m); background: var(--bg); font-size: 14px; color: var(--tx); min-width: 0; width: 100%; }
+.found { display: grid; gap: 2px; padding: 14px 16px; border-radius: var(--r-m); background: var(--raise); }
+.found b { font-weight: 500; overflow-wrap: anywhere; }
+.found span { font-size: 13px; color: var(--tx2); }
+.two { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 12px; }
+.end { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.btn.txt { background: none; color: var(--tx2); padding: 0 12px; }
+
+/* Connected button group: outer corners round, inner corners small, selection goes fully round. */
+.grp { display: flex; gap: 2px; }
+.grp button { height: 48px; padding: 0 20px; border: 0; border-radius: var(--r-s); background: var(--raise); font-weight: 500; color: var(--tx2); white-space: nowrap;
+  transition: border-radius .2s var(--ease), background-color .2s var(--ease), color .2s var(--ease); }
+.grp button:first-child { border-radius: var(--r-xl) var(--r-s) var(--r-s) var(--r-xl); }
+.grp button:last-child { border-radius: var(--r-s) var(--r-xl) var(--r-xl) var(--r-s); }
+.grp button[aria-pressed=true] { border-radius: var(--r-xl); background: var(--tx); color: var(--bg); }
+
+/* Wavy progress. Set --p (0 to 100) on the element or an ancestor. The wave is
+   the live part: add .still when no bytes are moving and it goes flat. The
+   filled width snaps to whole wave cycles so the line never ends mid-curve. */
+.wave { display: flex; align-items: center; gap: 6px; height: 16px; }
+.wave .v { width: calc(var(--p) * 1%); width: round(nearest, calc(var(--p) * 1%), 32px); height: 16px; background: var(--tone, var(--acc));
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='16'%3E%3Cpath d='M0 8Q8 -1 16 8T32 8' fill='none' stroke='%23000' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E") repeat-x left center / 32px 16px; }
+.wave.still .v { mask: none; height: 4px; border-radius: var(--r-full); width: calc(var(--p) * 1%); }
+.wave .t { flex: 1; height: 4px; border-radius: var(--r-full); background: var(--hair); }
+.wave .e { width: 4px; height: 4px; border-radius: 50%; background: var(--tone, var(--acc)); }
+
+/* Category shapes: each kind of file has its own silhouette. */
+.sh { display: grid; place-items: center; width: 40px; height: 40px; flex: none; background: var(--raise); font: 600 10px/1 var(--f); color: var(--tx2); border-radius: var(--r-m); }
+.sh[data-cat=image] { border-radius: 50%; }
+.sh[data-cat=video] { border-radius: 20px 6px 20px 6px; }
+.sh[data-cat=audio] { border-radius: 50% 50% 6px 6px; }
+.sh[data-cat=archive] { border-radius: 6px 20px 6px 20px; }
+.sh[data-cat=data] { border-radius: 0; clip-path: polygon(30% 0, 70% 0, 100% 30%, 100% 70%, 70% 100%, 30% 100%, 0 70%, 0 30%); }
+
+/* Wordmark */
+.brand { display: inline-flex; align-items: center; gap: 8px; font: 600 17px/1 var(--f); color: var(--tx); text-decoration: none; }

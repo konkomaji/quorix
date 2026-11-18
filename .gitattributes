@@ -1,0 +1,10 @@
+# Text files use LF in the repository and in the working tree, on every system.
+* text=auto eol=lf
+
+*.woff2 binary
+*.png binary
+
+# Generated files: hide them in diffs and language statistics.
+Cargo.lock linguist-generated
+assets/brand/*.svg linguist-generated
+extensions/chromium/theme/** linguist-generated

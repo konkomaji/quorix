@@ -1,0 +1,56 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Quorix Connect options</title>
+<link rel="stylesheet" href="theme/quorix.css">
+<link rel="stylesheet" href="ui.css">
+</head>
+<body class="options">
+<main>
+  <header class="head">
+    <span class="brand">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7.5" stroke="currentColor"/><path d="M16 16l5 5" stroke="var(--acc)"/></svg>
+      Quorix Connect
+    </span>
+    <span class="chip" id="status" role="status" data-state="checking">Checking</span>
+  </header>
+
+  <h1>Options</h1>
+
+  <form id="form">
+    <section class="card">
+      <label class="switch big"><input type="checkbox" id="capture" name="capture"><span><b>Take over browser downloads</b><small>When a matching download starts, Quorix is asked to take it. The browser keeps the download if Quorix does not confirm.</small></span></label>
+    </section>
+
+    <section class="card">
+      <label class="fld" for="fileTypes">File types to take over</label>
+      <input id="fileTypes" name="fileTypes" type="text" autocomplete="off" spellcheck="false">
+      <p class="hint">Extensions separated by spaces. Other files stay in the browser.</p>
+
+      <label class="fld" for="minSizeMb">Smallest file to take over, in MB</label>
+      <input id="minSizeMb" name="minSizeMb" type="number" min="0" max="100000" step="1" inputmode="numeric">
+      <p class="hint">Small files finish faster in the browser.</p>
+    </section>
+
+    <section class="card">
+      <label class="fld" for="excludedDomains">Sites Quorix never takes over</label>
+      <textarea id="excludedDomains" name="excludedDomains" rows="5" spellcheck="false" placeholder="example.com"></textarea>
+      <p class="hint">One site per line. Subdomains are included.</p>
+    </section>
+
+    <div class="end">
+      <span class="note" id="saved" role="status"></span>
+      <button class="btn sec" type="button" id="reset">Restore defaults</button>
+      <button class="btn pri" type="submit">Save</button>
+    </div>
+  </form>
+
+  <p class="privacy">Quorix Connect talks only to the Quorix app on this computer. It sends nothing to any server and collects no usage data.</p>
+</main>
+<script type="module" src="options.js"></script>
+</body>
+</html>

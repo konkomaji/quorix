@@ -1,0 +1,77 @@
+name: Bug report
+description: Report a defect in Quorix
+title: "Bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report a security problem here. Read SECURITY.md.
+        Remove tokens, passwords and private links from all text that you paste.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Command-line tool (quorix)
+        - Transfer engine (quorix-core)
+        - Browser extension (Quorix Connect)
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The output of `quorix --version`, or the commit hash.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 23H2
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to cause the problem
+      description: Write the exact command. Replace private links with an example link.
+      placeholder: |
+        1. Run `quorix https://example.com/file.zip -c 8`
+        2. Press Ctrl+C after 5 seconds
+        3. Run the same command again
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: Include the full error line, for example `error[QRX-E204]: ...`.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: integrity
+    attributes:
+      label: Did Quorix show a download as complete when the file was incorrect?
+      description: This is the most serious class of defect.
+      options:
+        - "No"
+        - "Yes"
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: more
+    attributes:
+      label: More information
+      description: The server type, the file size, the network conditions, or other facts that can help.

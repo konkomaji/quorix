@@ -1,0 +1,45 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>Quorix Connect</title>
+<link rel="stylesheet" href="theme/quorix.css">
+<link rel="stylesheet" href="ui.css">
+</head>
+<body class="popup">
+  <header class="head">
+    <span class="brand">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7.5" stroke="currentColor"/><path d="M16 16l5 5" stroke="var(--acc)"/></svg>
+      Quorix
+    </span>
+    <span class="chip" id="status" role="status" data-state="checking">Checking</span>
+  </header>
+
+  <form id="send" class="send">
+    <label class="vh" for="url">Link to download</label>
+    <input id="url" type="url" inputmode="url" placeholder="Paste a link" autocomplete="off" required>
+    <button class="btn pri" type="submit">Download</button>
+  </form>
+  <p class="note" id="note" role="status"></p>
+
+  <section class="missing" id="missing" hidden>
+    <h2>Quorix desktop was not found</h2>
+    <p>This extension only hands downloads to the desktop app. Until the app is installed, your browser keeps handling every download as usual.</p>
+    <a class="btn sec" href="https://github.com/konkomaji/quorix" target="_blank" rel="noreferrer">Project page</a>
+  </section>
+
+  <section id="recent-wrap" hidden>
+    <h2 class="cap">Sent from this browser</h2>
+    <ul id="recent" class="rows"></ul>
+  </section>
+
+  <footer class="foot">
+    <label class="switch"><input type="checkbox" id="capture"><span>Take over browser downloads</span></label>
+    <button class="link" id="options" type="button">Options</button>
+  </footer>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

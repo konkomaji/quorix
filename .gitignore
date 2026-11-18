@@ -1,0 +1,8 @@
+# Local only (never commit)
+.session/
+.claude/
+design/
+website/
+
+# Build output
+/target/

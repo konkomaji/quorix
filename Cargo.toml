@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/cli", "tests/support"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+repository = "https://github.com/konkomaji/quorix"
+license = "GPL-3.0-or-later"
+authors = ["konkomaji and the Quorix contributors"]
+publish = false
+
+[workspace.dependencies]
+quorix-core = { path = "crates/quorix-core" }
+quorix-http = { path = "crates/quorix-http" }
+quorix-storage = { path = "crates/quorix-storage" }
+quorix-integrity = { path = "crates/quorix-integrity" }
+quorix-state = { path = "crates/quorix-state" }
+quorix-testserver = { path = "tests/support" }
+
+blake3 = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "sync", "time", "signal"] }
+url = "2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

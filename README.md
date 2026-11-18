@@ -29,6 +29,7 @@ For planned work, read [ROADMAP.md](ROADMAP.md).
 - [Components](#components)
 - [Error codes](#error-codes)
 - [Test](#test)
+- [Measure](#measure)
 - [Contribute](#contribute)
 - [Security](#security)
 - [Licence](#licence)
@@ -99,7 +100,7 @@ The extension is in [`extensions/chromium`](extensions/chromium). It is for Chro
 - The redirect check does not find a public host name that points to a private address.
 - Quorix reads `Retry-After` as a number of seconds. It ignores the date format.
 - Quorix does not examine the free disk space before a download starts.
-- There are no published speed measurements. Do not assume that Quorix is faster than other tools.
+- The speed measurements are from a local server only. There are no measurements on real networks. Read [Measure](#measure).
 
 These parts are not built: the queue, the schedule, the speed limit, proxy settings, the desktop application, the native host for the extension, and installers.
 
@@ -190,6 +191,7 @@ For more detail, read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Path | Component | Function |
 |---|---|---|
 | `apps/cli` | `quorix` | The command-line tool. |
+| `apps/bench` | Quorix Bench | The tool that measures speed and integrity. |
 | `crates/quorix-core` | Quorix Core | The transfer engine: states, errors, transfer with one or many connections. |
 | `crates/quorix-http` | HTTP layer | The HTTP client, the redirect rules, range requests, and checks of the answers. |
 | `crates/quorix-storage` | Storage layer | The temporary file, writes at a position, safe file names, and the final move. |
@@ -228,6 +230,50 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 The integration tests use a local server that makes faults on purpose.
 The faults include: a connection that closes early, an incorrect length, an incorrect `Content-Range`, a server that refuses more connections, a temporary 503 status, a file that changes during the download, and a connection that stops.
+
+## Measure
+
+Quorix Bench measures speed and integrity against a server on the same computer.
+The network is not a variable, thus the results can be repeated.
+
+Build and run it:
+
+```sh
+cargo build --release -p quorix-bench
+./target/release/quorix-bench --runs 5
+```
+
+Quorix Bench also runs `curl` and `aria2c` for comparison, if they are installed.
+It compares each downloaded file with the expected content. A file that is incorrect is counted as a failure, not as a speed.
+
+### First results
+
+The full report is in [docs/bench](docs/bench).
+It is from one computer with Windows, 4 logical processors, and 5 runs for each row.
+
+**A server that limits the speed of each connection** (6 MiB file):
+
+| Tool | Connections | Median MiB/s |
+|---|---:|---:|
+| curl | 1 | 0.2 |
+| Quorix | 1 | 0.3 |
+| Quorix | 4 | 1.0 |
+| Quorix | 8 | 2.0 |
+| Quorix | 16 | 2.9 |
+
+More connections give more speed when the server limits each connection. This is the condition where a download manager helps.
+
+**A local server with no limit:** `curl` was faster than Quorix in these runs.
+The cause is known. Quorix synchronizes the file to the disk before it reports that the download is complete. `curl` does not.
+On this computer the synchronization was the largest part of the time, and the results changed much between runs.
+
+### What these results do not show
+
+- They do not show the speed on the internet.
+- They do not include `aria2c`, because it was not installed on the test computer.
+- They are from one computer and one disk.
+
+Do not use these numbers to say that Quorix is faster than a different tool.
 
 ## Contribute
 

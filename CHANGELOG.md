@@ -24,3 +24,14 @@ Quorix uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Browser extension Quorix Connect for Chrome and Edge. It cannot connect at this time, because the desktop application does not exist.
 - Shared visual theme with the Poppins font.
 - Local test server that makes faults on purpose.
+- Quorix Bench, a tool that measures speed and integrity against a local server.
+
+### Changed
+
+- The first request of a download asks for 256 KiB, not 1 MiB. On a slow server the large first part controlled the time of the full download.
+- The minimum size of a part is 256 KiB, not 1 MiB. Small files can use all the connections that the user sets.
+
+### Fixed
+
+- The test server limited the speed only for range requests. A client without a range request got the file at full speed, which made comparisons incorrect.
+- The test server built the full file for each range request.

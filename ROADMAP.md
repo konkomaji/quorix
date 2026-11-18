@@ -28,7 +28,7 @@ The engineering rules are in [Quorix_SOP.md](Quorix_SOP.md).
 | SHA-256 and BLAKE3 verification | Done |
 | Command-line tool | Done |
 | Fault-injection tests | Done, more scenarios to add |
-| Quorix Bench | Next |
+| Quorix Bench, first version | Done |
 
 ## Engine work after 0.1, in this sequence
 
@@ -42,7 +42,16 @@ A tool that measures speed and reliability in controlled conditions.
 - It compares Quorix with other tools, for example aria2 and curl, with equal settings.
 - It publishes the method, the hardware and the raw numbers.
 
-Without Quorix Bench, no speed statement about Quorix is permitted.
+Status: the first version is done. It uses a local server with three conditions.
+
+Still to do:
+
+- Add conditions: high latency, packet loss, a slow disk, very small files, a restart in the middle.
+- Measure processor use and peak memory.
+- Run the comparison with aria2 on a computer that has it.
+- Publish results from more than one computer.
+
+No speed statement about Quorix is permitted without a published Quorix Bench report that supports it.
 
 ### 2. Adaptive scheduler with hedged requests
 

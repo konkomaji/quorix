@@ -48,6 +48,12 @@ pub fn body(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i.wrapping_mul(31).wrapping_add(i >> 8) % 251) as u8).collect()
 }
 
+/// Bytes `start..=end` of [`body_of_version`], without building the rest of the file.
+pub fn body_range(start: usize, end: usize, version: u32) -> Vec<u8> {
+    let mask = if version == 1 { 0 } else { 0x5a };
+    (start..=end).map(|i| ((i.wrapping_mul(31).wrapping_add(i >> 8) % 251) as u8) ^ mask).collect()
+}
+
 /// Payload of resource version `version`. Version 1 is [`body`]; other versions differ in every byte.
 pub fn body_of_version(len: usize, version: u32) -> Vec<u8> {
     let mask = if version == 1 { 0 } else { 0x5a };
@@ -188,7 +194,6 @@ async fn serve(mut stream: TcpStream, state: &State) -> std::io::Result<()> {
 
 async fn ranged(stream: &mut TcpStream, state: &State, route: &str, n: usize, request: &str, hit: u32) -> std::io::Result<()> {
     let version = state.version.load(Ordering::SeqCst);
-    let data = body_of_version(n, version);
     let etag = if route == "range-weak" { format!("W/\"v{version}\"") } else { format!("\"v{version}\"") };
     let length = |len: usize| ("Content-Length", len.to_string());
 
@@ -199,7 +204,13 @@ async fn ranged(stream: &mut TcpStream, state: &State, route: &str, n: usize, re
     // If-Range names a version that is gone: answer with the whole current file.
     let version_matches = header(request, "if-range").is_none_or(|wanted| wanted == etag);
     let Some((start, end)) = requested_range(request, n).filter(|_| version_matches) else {
-        return send(stream, "200 OK", &[length(n), ("ETag", etag)], &data).await;
+        let whole = body_of_version(n, version);
+        let headers = [length(n), ("ETag", etag)];
+        if matches!(route, "range-slow" | "range-weak") && state.unthrottled.load(Ordering::SeqCst) == 0 {
+            send(stream, "200 OK", &headers, b"").await?;
+            return trickle(stream, &whole).await;
+        }
+        return send(stream, "200 OK", &headers, &whole).await;
     };
 
     if route == "range-one" && state.serving.fetch_add(1, Ordering::SeqCst) > 0 {
@@ -214,7 +225,8 @@ async fn ranged(stream: &mut TcpStream, state: &State, route: &str, n: usize, re
         ("ETag", etag),
         ("Accept-Ranges", "bytes".into()),
     ];
-    let slice = &data[start..=end];
+    let data = body_range(start, end, version);
+    let slice = &data[..];
     let result = match route {
         "range-half" => send(stream, "206 Partial Content", &headers, &slice[..slice.len().div_ceil(2)]).await,
         "range-slow" | "range-one" | "range-weak" if state.unthrottled.load(Ordering::SeqCst) == 0 => {
@@ -238,6 +250,16 @@ async fn ranged(stream: &mut TcpStream, state: &State, route: &str, n: usize, re
         _ => send(stream, "206 Partial Content", &headers, slice).await,
     };
     result
+}
+
+/// Sends `payload` in small pieces with a pause after each: a server that limits the speed of one connection.
+async fn trickle(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+    for piece in payload.chunks(4096) {
+        stream.write_all(piece).await?;
+        stream.flush().await?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
 }
 
 async fn send(stream: &mut TcpStream, status: &str, headers: Headers<'_>, payload: &[u8]) -> std::io::Result<()> {

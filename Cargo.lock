@@ -810,6 +810,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "quorix-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "quorix-core",
+ "quorix-integrity",
+ "quorix-testserver",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "quorix-cli"
 version = "0.1.0"
 dependencies = [

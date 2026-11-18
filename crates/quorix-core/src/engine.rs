@@ -126,7 +126,7 @@ impl DownloadRequest {
     /// Piece size for a file of `total` bytes: small enough that a slow
     /// connection holds little work, large enough that request overhead stays negligible.
     fn piece_size_for(&self, total: u64) -> u64 {
-        self.piece_size.unwrap_or_else(|| (total / (self.connection_limit() as u64 * 4)).clamp(MIB, 16 * MIB)).max(1)
+        self.piece_size.unwrap_or_else(|| (total / (self.connection_limit() as u64 * 4)).clamp(MIB / 4, 16 * MIB)).max(1)
     }
 }
 
@@ -333,7 +333,8 @@ async fn run(request: &DownloadRequest, cancel: &CancelToken, life: &mut Lifecyc
 /// is a claim; a correct `206` is proof. The answer is not wasted: its body is
 /// the first piece of the download.
 async fn inspect(client: &Client, url: &Url, request: &DownloadRequest, cancel: &CancelToken) -> Result<Inspected, Error> {
-    let probe_end = request.piece_size.unwrap_or(MIB).clamp(1, MIB) - 1;
+    // Small on purpose: on a slow server one large first piece would set the time of the whole download.
+    let probe_end = request.piece_size.unwrap_or(MIB / 4).clamp(1, MIB) - 1;
     let mut failures = 0;
     loop {
         let attempt = async {
@@ -580,7 +581,8 @@ mod tests {
     #[test]
     fn piece_size_scales_with_the_file_and_stays_bounded() {
         let request = DownloadRequest::new("https://example.com/f", Target::Directory(".".into()));
-        assert_eq!(request.piece_size_for(10 * MIB), MIB);
+        assert_eq!(request.piece_size_for(MIB), MIB / 4);
+        assert_eq!(request.piece_size_for(16 * MIB), MIB);
         assert_eq!(request.piece_size_for(160 * MIB), 10 * MIB);
         assert_eq!(request.piece_size_for(100_000 * MIB), 16 * MIB);
     }

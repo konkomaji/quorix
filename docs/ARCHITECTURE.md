@@ -127,6 +127,30 @@ Without a strong `ETag`, no part is fetched two times.
 
 The progress counter adds only bytes that were not on the disk before. A hedged request does not make the progress larger than the file.
 
+## Multipath transfer
+
+A computer can have two or more network adapters, for example Ethernet and Wi-Fi.
+The engine can use them at the same time.
+
+- The caller gives one local address for each adapter.
+- The engine makes one HTTP client for each address. A client sends only from its address, and the operating system uses the adapter that owns the address.
+- Each connection has a home path. Connection number `n` uses path `n` modulo the number of paths.
+
+### When a path fails
+
+A path failure is one of these: no connection, a timeout, or a connection that closed before data arrived.
+A bad answer from the server is not a path failure.
+
+1. The connection counts one failure for its path.
+2. If a different path operates, the connection completes the current part on that path, without a wait.
+3. For the next part, the connection goes back to its home path.
+4. Data that arrives on a path sets the failure count of that path to zero.
+5. After 3 failures in sequence, the engine stops the use of the path and tells the caller.
+
+If only one path remains, its failures are handled as usual, with the retry rules.
+
+The first request of a download tries each path in sequence. One adapter that cannot connect does not stop the download.
+
 ## Progress file and recovery
 
 The progress file is `<name>.qrxpart.state`.

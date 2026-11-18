@@ -49,6 +49,8 @@ For planned work, read [ROADMAP.md](ROADMAP.md).
 - Quorix writes each part directly to its final position in the file.
 - Memory use for each connection has a fixed limit. It does not increase with the file size.
 - If a server refuses more connections, Quorix continues with fewer connections.
+- Quorix can use two or more network adapters at the same time, for example Ethernet and Wi-Fi. You give the local address of each adapter with `--bind`.
+- If one adapter cannot reach the server, Quorix tells you and continues with the other adapters.
 
 **Pause, resume and recovery**
 
@@ -110,6 +112,9 @@ The extension is in [`extensions/chromium`](extensions/chromium). It is for Chro
 - The automatic mode is slow to add connections on short downloads. Use `-c` to set a fixed number.
 - After the automatic mode has selected a number of connections, it does not measure again during that download.
 - A connection requests a part again only if the server sends a strong `ETag`.
+- Quorix does not find your network adapters automatically. You must give the addresses with `--bind`.
+- The use of two adapters is not measured on two real internet links. The tests use two local addresses on one computer.
+- If Quorix stops the use of an adapter, it does not try that adapter again during the download.
 - Quorix does not examine the free disk space before a download starts.
 - The speed measurements are from a local server only. There are no measurements on real networks. Read [Measure](#measure).
 
@@ -142,6 +147,14 @@ Download a file to the current folder:
 quorix https://example.com/file.zip
 ```
 
+Use two network adapters at the same time. Replace the addresses with the addresses of your adapters:
+
+```sh
+quorix https://example.com/file.zip --bind 192.168.1.20 --bind 10.0.0.15
+```
+
+To find the addresses, run `ipconfig` on Windows or `ip addr` on Linux.
+
 Download to a folder, use 8 connections, and verify a checksum:
 
 ```sh
@@ -154,6 +167,7 @@ quorix https://example.com/file.zip -o downloads/ -c 8 --sha256 <hex>
 |---|---|
 | `-o`, `--output <PATH>` | Sets the file or the folder for the download. The default is the current folder. |
 | `-c`, `--connections <N>` | Uses exactly this number of connections, from 1 to 16. Without this option, Quorix uses the automatic mode. |
+| `--bind <ADDRESS>` | Sends from this local IP address. Use the option two or more times to use two or more network adapters. |
 | `--sha256 <HEX>` | Gives the SHA-256 checksum that the file must have. |
 | `--blake3 <HEX>` | Gives the BLAKE3 checksum that the file must have. |
 | `--overwrite` | Replaces the destination file if it exists. |

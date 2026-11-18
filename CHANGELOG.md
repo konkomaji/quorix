@@ -27,6 +27,7 @@ Quorix uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Quorix Bench, a tool that measures speed and integrity against a local server.
 
 - Automatic mode for the number of connections. It starts with 4 and adds connections only while the measured speed increases.
+- Multipath transfer. The option `--bind` gives a local address. With two or more addresses, Quorix divides the connections between the network adapters. An adapter that cannot reach the server is reported and not used.
 - Block hashes. The progress file stores a BLAKE3 hash for each completed block. Before saved data is used again, each block is read from the disk and compared.
 - Option `--no-recheck`, which uses saved data without the check.
 - Hedged requests. A free connection requests a slow or stopped part again, if the server sends a strong `ETag`.

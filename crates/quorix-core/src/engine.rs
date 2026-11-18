@@ -13,7 +13,7 @@ use quorix_integrity::{blake3_hex, Algorithm, Expected, Hasher};
 use quorix_state::{block_range, Checkpoint, Ranges};
 use quorix_storage::{sanitize_file_name, state_path_for, PartFile};
 
-use crate::segmented::{self, Ended, Plan};
+use crate::segmented::{self, Ended, Plan, Route};
 use crate::{CancelToken, Error, TaskState};
 
 pub(crate) const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -101,6 +101,9 @@ pub struct DownloadRequest {
     pub hedge_after: Duration,
     /// Continue from a partial file left by an earlier run when that is provably safe.
     pub resume: bool,
+    /// Local addresses to send from, one for each network adapter to use.
+    /// Connections are spread over them. Empty lets the operating system choose.
+    pub local_addresses: Vec<std::net::IpAddr>,
     /// Before reusing saved data, read it back and compare it with the saved block hashes.
     /// Data that does not match is downloaded again. Turning this off trusts the partial file as it is.
     pub verify_resume: bool,
@@ -126,6 +129,7 @@ impl DownloadRequest {
             hedge_after: Duration::from_secs(2),
             resume: true,
             verify_resume: true,
+            local_addresses: Vec::new(),
             retry: RetryPolicy::default(),
             checkpoint_interval: Duration::from_secs(2),
             piece_size: None,
@@ -208,6 +212,8 @@ pub enum Event {
         /// Bytes that did not match, or had no hash, and are downloaded again.
         discarded: u64,
     },
+    /// A network adapter failed repeatedly while another one worked. The engine stopped using it.
+    PathDown(std::net::IpAddr),
     /// The engine changed how many connections it uses.
     Connections(usize),
     /// Bytes written so far.
@@ -270,8 +276,8 @@ enum Inspected {
 async fn run(request: &DownloadRequest, cancel: &CancelToken, life: &mut Lifecycle<'_>) -> Result<Outcome, Error> {
     life.enter(TaskState::Inspecting);
     let url = parse_url(&request.url)?;
-    let client = Client::new(&request.http)?;
-    let inspected = inspect(&client, &url, request, cancel).await?;
+    let routes = routes_for(request)?;
+    let inspected = inspect(&routes, &url, request, cancel).await?;
 
     let response = match &inspected {
         Inspected::Ranged { first, .. } => first,
@@ -305,7 +311,7 @@ async fn run(request: &DownloadRequest, cancel: &CancelToken, life: &mut Lifecyc
             // The first answer already holds the start of the file. Use it unless those bytes are on disk.
             let first = (resumed == 0).then_some((first, 0, first_end));
             let plan = Plan {
-                client,
+                routes,
                 url,
                 part: part.clone(),
                 total,
@@ -361,19 +367,21 @@ async fn run(request: &DownloadRequest, cancel: &CancelToken, life: &mut Lifecyc
 /// server's capabilities from how it answers. A header such as `Accept-Ranges`
 /// is a claim; a correct `206` is proof. The answer is not wasted: its body is
 /// the first piece of the download.
-async fn inspect(client: &Client, url: &Url, request: &DownloadRequest, cancel: &CancelToken) -> Result<Inspected, Error> {
+async fn inspect(routes: &[Route], url: &Url, request: &DownloadRequest, cancel: &CancelToken) -> Result<Inspected, Error> {
     // Small on purpose: on a slow server one large first piece would set the time of the whole download.
     let probe_end = request.piece_size.unwrap_or(MIB / 4).clamp(1, MIB) - 1;
     let mut failures = 0;
     loop {
         let attempt = async {
-            let response = client.get_range(url, 0, probe_end, None).await?;
-            let response = match response.status() {
-                // An empty file cannot satisfy any range. Ask for it plainly.
-                416 => client.get(url).await?,
-                _ => response,
-            };
-            classify_first_answer(response, probe_end)
+            // With several network adapters, one that cannot reach the server must not stop the download.
+            let mut unreachable = None;
+            for route in routes {
+                match probe(&route.client, url, probe_end).await {
+                    Err(error @ (Error::Connect(_) | Error::Timeout)) => unreachable = Some(error),
+                    answer => return answer,
+                }
+            }
+            Err(unreachable.unwrap_or_else(|| Error::Internal("no network route was configured".into())))
         };
         let result = tokio::select! {
             biased;
@@ -393,6 +401,33 @@ async fn inspect(client: &Client, url: &Url, request: &DownloadRequest, cancel: 
             }
         }
     }
+}
+
+async fn probe(client: &Client, url: &Url, probe_end: u64) -> Result<Inspected, Error> {
+    let response = client.get_range(url, 0, probe_end, None).await?;
+    let response = match response.status() {
+        // An empty file cannot satisfy any range. Ask for it plainly.
+        416 => client.get(url).await?,
+        _ => response,
+    };
+    classify_first_answer(response, probe_end)
+}
+
+/// One HTTP client for each local address the caller named, or a single one that lets the system choose.
+fn routes_for(request: &DownloadRequest) -> Result<Vec<Route>, Error> {
+    let mut addresses = request.local_addresses.clone();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Ok(vec![Route { client: Client::new(&request.http)?, address: None }]);
+    }
+    addresses
+        .into_iter()
+        .map(|address| {
+            let mut config = request.http.clone();
+            config.local_address = Some(address);
+            Ok(Route { client: Client::new(&config)?, address: Some(address) })
+        })
+        .collect()
 }
 
 fn classify_first_answer(response: Response, probe_end: u64) -> Result<Inspected, Error> {

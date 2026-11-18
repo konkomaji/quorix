@@ -90,9 +90,19 @@ Still to do:
 
 ### 4. Multipath transfer
 
-- The engine uses two or more network adapters at the same time, for example Ethernet and Wi-Fi.
-- Each connection is attached to one adapter.
-- The total speed can be near the sum of the adapters.
+Status: the first version is done.
+
+- The user gives the local address of each network adapter.
+- The engine makes one HTTP client for each address and divides the connections between them.
+- If an adapter fails 3 times in sequence while a different adapter operates, the engine stops the use of that adapter and tells the user.
+- If no adapter can connect, the download fails with a connection error.
+
+Still to do:
+
+- Find the network adapters automatically.
+- Measure the speed on two real internet links. The current tests use two local addresses on one computer.
+- Try an adapter again after some time, because a network can come back.
+- Give more connections to the faster adapter.
 
 ### 5. Other engine items
 

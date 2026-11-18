@@ -33,6 +33,11 @@ struct Args {
     #[arg(short = 'c', long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=16))]
     connections: Option<u8>,
 
+    /// Send from this local IP address. Repeat the option to use several network
+    /// adapters at the same time, for example Ethernet and Wi-Fi.
+    #[arg(long, value_name = "ADDRESS")]
+    bind: Vec<std::net::IpAddr>,
+
     /// SHA-256 checksum the file must match
     #[arg(long, value_name = "HEX", conflicts_with = "blake3")]
     sha256: Option<String>,
@@ -91,6 +96,7 @@ async fn run(args: Args) -> Result<ExitCode, Error> {
         request.connections = usize::from(fixed);
         request.adaptive = false;
     }
+    request.local_addresses = args.bind;
     request.resume = !args.no_resume;
     request.verify_resume = !args.no_recheck;
 
@@ -168,6 +174,12 @@ impl Progress {
 
     fn handle(&self, event: Event) {
         // A result of the check is a fact the user must see, also when the output goes to a file.
+        if let Event::PathDown(address) = event {
+            if !self.quiet {
+                eprintln!("The network adapter with the address {address} cannot reach the server. Quorix continues without it.");
+            }
+            return;
+        }
         if let Event::Rechecked { verified, discarded } = event {
             if discarded > 0 && !self.quiet {
                 eprintln!(
@@ -213,7 +225,7 @@ impl Progress {
                 let _ = err.flush();
             }
             Event::Connections(connections) => meter.connections = connections,
-            Event::Rechecked { .. } => {}
+            Event::Rechecked { .. } | Event::PathDown(_) => {}
             Event::State(_) => {}
         }
     }

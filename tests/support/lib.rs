@@ -34,18 +34,20 @@
 //! | `/range-lag/<n>` | the first connection is very slow, later ones are fast |
 //! | `/range-stall1/<n>` | the first connection sends half its range, then goes silent |
 //! | `/range-shared/<n>` | one speed limit shared by all connections |
+//! | `/range-peraddr/<n>` | one speed limit for each client address |
 //! | `/range-weak/<n>` | throttled like `range-slow`, but the `ETag` is weak |
 
-use std::net::SocketAddr;
+use std::collections::{BTreeSet, HashMap};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-/// Total speed of the `range-shared` route, for all its connections together.
+/// Speed of one limit on the `range-shared` and `range-peraddr` routes.
 const SHARED_LIMIT_BYTES_PER_SECOND: f64 = 600_000.0;
 
 /// Deterministic test payload of `len` bytes. Not a repeating single byte, so
@@ -66,10 +68,17 @@ pub fn body_of_version(len: usize, version: u32) -> Vec<u8> {
     body(len).into_iter().map(|b| b ^ mask).collect()
 }
 
+/// A speed limit that follows the clock: when it started and how many bytes it let through.
+type Bucket = Arc<tokio::sync::Mutex<Option<(tokio::time::Instant, u64)>>>;
+
 #[derive(Default)]
 struct State {
     /// Held while one connection sends, on the route with a limit shared by all connections.
-    gate: tokio::sync::Mutex<Option<(tokio::time::Instant, u64)>>,
+    gate: Bucket,
+    /// One speed limit for each client address, on the route that limits by address.
+    per_address: Mutex<HashMap<IpAddr, Bucket>>,
+    /// Every client address that sent a request.
+    peers: Mutex<BTreeSet<IpAddr>>,
     unthrottled: AtomicU32,
     version: AtomicU32,
     hits: AtomicU32,
@@ -91,10 +100,10 @@ impl TestServer {
         let state = Arc::new(State { version: AtomicU32::new(1), ..State::default() });
         let shared = Arc::clone(&state);
         let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok((stream, peer)) = listener.accept().await {
                 let state = Arc::clone(&shared);
                 tokio::spawn(async move {
-                    let _ = serve(stream, &state).await;
+                    let _ = serve(stream, &state, peer.ip()).await;
                 });
             }
         });
@@ -115,6 +124,11 @@ impl TestServer {
     /// on a slow server and finish quickly on the very same address.
     pub fn stop_throttling(&self) {
         self.state.unthrottled.store(1, Ordering::SeqCst);
+    }
+
+    /// Every client address that sent a request, sorted.
+    pub fn peer_addresses(&self) -> Vec<IpAddr> {
+        self.state.peers.lock().unwrap().iter().copied().collect()
     }
 
     /// Requests received so far.
@@ -146,7 +160,8 @@ fn requested_range(request: &str, len: usize) -> Option<(usize, usize)> {
     (start <= end).then_some((start, end))
 }
 
-async fn serve(mut stream: TcpStream, state: &State) -> std::io::Result<()> {
+async fn serve(mut stream: TcpStream, state: &State, peer: IpAddr) -> std::io::Result<()> {
+    state.peers.lock().unwrap().insert(peer);
     let mut raw = Vec::new();
     let mut buf = [0u8; 1024];
     while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -194,12 +209,20 @@ async fn serve(mut stream: TcpStream, state: &State) -> std::io::Result<()> {
         }
         "range-ignore" => send(&mut stream, "200 OK", &[length(n), ("Accept-Ranges", "bytes".into())], &body(n)).await,
         "range" | "range-slow" | "range-half" | "range-badcr" | "range-one" | "range-503" | "range-weak" | "range-lag" | "range-stall1"
-        | "range-shared" => ranged(&mut stream, state, route, n, &request, hit).await,
+        | "range-shared" | "range-peraddr" => ranged(&mut stream, state, route, n, &request, hit, peer).await,
         _ => send(&mut stream, "404 Not Found", &[length(0)], b"").await,
     }
 }
 
-async fn ranged(stream: &mut TcpStream, state: &State, route: &str, n: usize, request: &str, hit: u32) -> std::io::Result<()> {
+async fn ranged(
+    stream: &mut TcpStream,
+    state: &State,
+    route: &str,
+    n: usize,
+    request: &str,
+    hit: u32,
+    peer: IpAddr,
+) -> std::io::Result<()> {
     let version = state.version.load(Ordering::SeqCst);
     let etag = if route == "range-weak" { format!("W/\"v{version}\"") } else { format!("\"v{version}\"") };
     let length = |len: usize| ("Content-Length", len.to_string());
@@ -257,13 +280,18 @@ async fn ranged(stream: &mut TcpStream, state: &State, route: &str, n: usize, re
             Ok(())
         }
         // One speed limit for the whole server: more connections bring no more speed.
-        "range-shared" => {
+        "range-shared" | "range-peraddr" => {
+            let bucket = if route == "range-shared" {
+                Arc::clone(&state.gate)
+            } else {
+                Arc::clone(state.per_address.lock().unwrap().entry(peer).or_default())
+            };
             send(stream, "206 Partial Content", &headers, b"").await?;
             let mut result = Ok(());
             for piece in slice.chunks(8192) {
                 // The limit follows the clock, not the length of a sleep, so it is the
                 // same on systems whose timers have different precision.
-                let mut budget = state.gate.lock().await;
+                let mut budget = bucket.lock().await;
                 let (since, sent) = budget.get_or_insert_with(|| (tokio::time::Instant::now(), 0));
                 result = stream.write_all(piece).await;
                 if result.is_err() {

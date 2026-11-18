@@ -25,6 +25,9 @@ pub struct ClientConfig {
     pub allow_insecure_redirect: bool,
     /// Use the proxy configured in the environment.
     pub use_system_proxy: bool,
+    /// Send from this local address. The operating system then uses the network
+    /// adapter that owns the address. `None` lets the system choose.
+    pub local_address: Option<std::net::IpAddr>,
     /// `User-Agent` header value.
     pub user_agent: String,
 }
@@ -37,6 +40,7 @@ impl Default for ClientConfig {
             read_timeout: Duration::from_secs(60),
             allow_insecure_redirect: false,
             use_system_proxy: true,
+            local_address: None,
             user_agent: concat!("Quorix/", env!("CARGO_PKG_VERSION")).to_string(),
         }
     }
@@ -147,6 +151,9 @@ impl Client {
             .user_agent(config.user_agent.clone());
         if !config.use_system_proxy {
             builder = builder.no_proxy();
+        }
+        if let Some(address) = config.local_address {
+            builder = builder.local_address(address);
         }
         let inner = builder.build().map_err(|e| HttpError::Other(e.to_string()))?;
         Ok(Self { inner })

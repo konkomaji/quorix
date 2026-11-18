@@ -26,6 +26,7 @@
 //! - A checkpoint only lists bytes that were synced to disk before it was saved.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -56,9 +57,19 @@ const MIN_SAMPLE_MS: u64 = 500;
 /// How often an idle worker looks for a piece to hedge.
 const IDLE_POLL: Duration = Duration::from_millis(100);
 
+/// Failures in a row, with no bytes received, after which a network path is no longer used.
+const PATH_STRIKES: u32 = 3;
+
+/// One way out to the network: an HTTP client and the local address it sends from.
+pub(crate) struct Route {
+    pub client: Client,
+    pub address: Option<IpAddr>,
+}
+
 /// Everything a segmented transfer needs.
 pub(crate) struct Plan {
-    pub client: Client,
+    /// Network paths to spread the connections over. Never empty.
+    pub routes: Vec<Route>,
     pub url: Url,
     pub part: PartFile,
     pub total: u64,
@@ -131,6 +142,16 @@ enum Stop {
 enum Note {
     Retrying,
     Flowing,
+    /// The path with this index was taken out of use.
+    PathDown(usize),
+}
+
+struct Path {
+    client: Client,
+    address: Option<IpAddr>,
+    /// Failures in a row on this path with no bytes received.
+    strikes: AtomicU32,
+    down: AtomicBool,
 }
 
 /// One piece being fetched. Shared between its owner and, at most, one hedging worker.
@@ -169,7 +190,7 @@ struct Queue {
 }
 
 struct Shared {
-    client: Client,
+    paths: Vec<Path>,
     url: Url,
     part: PartFile,
     total: u64,
@@ -231,6 +252,26 @@ enum Work {
 impl Shared {
     fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
+    }
+
+    /// The path to use for worker number `index`: its own when it is up, otherwise the next one that is.
+    fn usable_path(&self, index: usize) -> usize {
+        let count = self.paths.len();
+        (0..count).map(|step| (index + step) % count).find(|&i| !self.paths[i].down.load(Ordering::Relaxed)).unwrap_or(index % count)
+    }
+
+    /// Counts a failure of `path` itself: no connection, a timeout, or a
+    /// connection that closed before any byte arrived. Returns another path to
+    /// move to when one is up. `None` means this is the only path left, and
+    /// the failure is handled like any other.
+    fn path_failed(&self, path: usize) -> Option<usize> {
+        let count = self.paths.len();
+        let other = (1..count).map(|step| (path + step) % count).find(|&i| !self.paths[i].down.load(Ordering::Relaxed))?;
+        let strikes = self.paths[path].strikes.fetch_add(1, Ordering::Relaxed) + 1;
+        if strikes >= PATH_STRIKES && !self.paths[path].down.swap(true, Ordering::Relaxed) {
+            let _ = self.notes.send(Note::PathDown(path));
+        }
+        Some(other)
     }
 
     /// Records the first fatal error and tells every worker to stop.
@@ -313,8 +354,8 @@ impl Shared {
 
     /// Requests bytes `start..end` and checks that the answer is exactly that.
     /// Returns the response and the end of the range it actually carries.
-    async fn open(&self, start: u64, end: u64) -> Result<(Response, u64), Error> {
-        let response = self.client.get_range(&self.url, start, end - 1, self.strong_etag.as_deref()).await?;
+    async fn open(&self, path: usize, start: u64, end: u64) -> Result<(Response, u64), Error> {
+        let response = self.paths[path].client.get_range(&self.url, start, end - 1, self.strong_etag.as_deref()).await?;
         match response.status() {
             206 => {
                 let range = response
@@ -440,7 +481,7 @@ impl Shared {
 
     /// Fetches the rest of another worker's piece. One attempt: a hedge that
     /// fails is simply dropped, because the owner is still working on the piece.
-    async fn hedge(&self, claim: &Claim, from: u64, stop: &mut watch::Receiver<Stop>) {
+    async fn hedge(&self, claim: &Claim, from: u64, path: usize, stop: &mut watch::Receiver<Stop>) {
         let mut position = from;
         let mut finished = claim.done.subscribe();
         while position < claim.end && !claim.is_done() {
@@ -448,7 +489,7 @@ impl Shared {
                 biased;
                 _ = stop.changed() => return,
                 _ = finished.changed() => return,
-                opened = self.open(position, claim.end) => opened,
+                opened = self.open(path, position, claim.end) => opened,
             };
             let outcome = match opened {
                 Ok((mut response, range_end)) => self.pump(&mut response, &mut position, range_end, claim, false, stop).await,
@@ -555,7 +596,16 @@ impl Shared {
     }
 }
 
-async fn worker(shared: Arc<Shared>, first: Option<(Response, Arc<Claim>)>) {
+/// Errors that say the way to the server failed, not that the server gave a bad answer.
+fn is_path_failure(error: &Error) -> bool {
+    matches!(error, Error::Connect(_) | Error::Timeout | Error::ConnectionClosed)
+}
+
+async fn worker(shared: Arc<Shared>, first: Option<(Response, Arc<Claim>)>, index: usize) {
+    // Each worker has a home path. After a failure it finishes the current piece
+    // on another path, then tries its home again. So a path that keeps failing
+    // collects strikes and is taken out of use, while one bad moment costs nothing.
+    let home = index % shared.paths.len();
     let mut stop = shared.stop.subscribe();
     let mut carried = first;
     let mut my_rate = 0u64;
@@ -565,7 +615,7 @@ async fn worker(shared: Arc<Shared>, first: Option<(Response, Arc<Claim>)>) {
             None => match shared.take(my_rate) {
                 Work::Piece(claim) => (None, claim),
                 Work::Hedge(claim, from) => {
-                    shared.hedge(&claim, from, &mut stop).await;
+                    shared.hedge(&claim, from, shared.usable_path(home), &mut stop).await;
                     continue;
                 }
                 Work::Wait => {
@@ -579,6 +629,7 @@ async fn worker(shared: Arc<Shared>, first: Option<(Response, Arc<Claim>)>) {
             },
         };
 
+        let mut path = shared.usable_path(home);
         let began = Instant::now();
         let mut position = claim.start;
         let mut finished = claim.done.subscribe();
@@ -592,7 +643,7 @@ async fn worker(shared: Arc<Shared>, first: Option<(Response, Arc<Claim>)>) {
                     biased;
                     _ = stop.changed() => return,
                     _ = finished.changed() => break,
-                    opened = shared.open(position, claim.end) => opened,
+                    opened = shared.open(path, position, claim.end) => opened,
                 },
             };
             let failure = match opened {
@@ -604,6 +655,7 @@ async fn worker(shared: Arc<Shared>, first: Option<(Response, Arc<Claim>)>) {
                     let progressed = position > before;
                     if progressed {
                         shared.failures.store(0, Ordering::Relaxed);
+                        shared.paths[path].strikes.store(0, Ordering::Relaxed);
                     }
                     match pumped {
                         Ok(Pumped::Done) => continue,
@@ -614,6 +666,13 @@ async fn worker(shared: Arc<Shared>, first: Option<(Response, Arc<Claim>)>) {
                     }
                 }
             };
+            // A failed path is not a failed download while another path works: move there and try at once.
+            if !failure.1 && is_path_failure(&failure.0) {
+                if let Some(other) = shared.path_failed(path) {
+                    path = other;
+                    continue;
+                }
+            }
             match shared.after_failure(failure.0, failure.1, &claim, position, &mut stop).await {
                 Next::Retry => {}
                 Next::Leave => return,
@@ -713,7 +772,11 @@ pub(crate) async fn run(mut plan: Plan, cancel: &CancelToken, life: &mut Lifecyc
     let (stop_tx, _) = watch::channel(Stop::Run);
     let (note_tx, mut notes) = mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
-        client: plan.client,
+        paths: plan
+            .routes
+            .into_iter()
+            .map(|route| Path { client: route.client, address: route.address, strikes: AtomicU32::new(0), down: AtomicBool::new(false) })
+            .collect(),
         url: plan.url,
         part: plan.part,
         total,
@@ -741,8 +804,10 @@ pub(crate) async fn run(mut plan: Plan, cancel: &CancelToken, life: &mut Lifecyc
         let claim = shared.claim(&mut lock(&shared.queue), start, end);
         (response, claim)
     });
+    let mut spawned = 0;
     for _ in 0..workers {
-        tasks.spawn(worker(Arc::clone(&shared), first.take()));
+        tasks.spawn(worker(Arc::clone(&shared), first.take(), spawned));
+        spawned += 1;
     }
 
     let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
@@ -773,6 +838,11 @@ pub(crate) async fn run(mut plan: Plan, cancel: &CancelToken, life: &mut Lifecyc
             Some(note) = notes.recv() => match (note, life.state()) {
                 (Note::Retrying, TaskState::Downloading) => life.enter(TaskState::Retrying),
                 (Note::Flowing, TaskState::Retrying) => life.enter(TaskState::Downloading),
+                (Note::PathDown(index), _) => {
+                    if let Some(address) = shared.paths[index].address {
+                        (life.sink)(Event::PathDown(address));
+                    }
+                }
                 _ => {}
             },
             _ = ticker.tick() => {
@@ -798,7 +868,8 @@ pub(crate) async fn run(mut plan: Plan, cancel: &CancelToken, life: &mut Lifecyc
                         if extra > 0 && *shared.stop.borrow() == Stop::Run {
                             shared.allowed.store(current + extra, Ordering::Relaxed);
                             for _ in 0..extra {
-                                tasks.spawn(worker(Arc::clone(&shared), None));
+                                tasks.spawn(worker(Arc::clone(&shared), None, spawned));
+                                spawned += 1;
                             }
                             (life.sink)(Event::Connections(current + extra));
                         } else {

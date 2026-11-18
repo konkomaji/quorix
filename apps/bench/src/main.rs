@@ -20,6 +20,8 @@ use quorix_integrity::{Algorithm, Hasher};
 use quorix_testserver::{body, TestServer};
 
 const MIB: usize = 1024 * 1024;
+/// Connection count that means "let Quorix decide".
+const AUTO: usize = 0;
 
 /// Measure Quorix against a local server under controlled conditions.
 #[derive(Parser)]
@@ -55,14 +57,14 @@ fn scenarios(quick: bool) -> Vec<Scenario> {
             shows: "The server sends slowly on each connection. More connections must give more speed.",
             route: "range-slow",
             size: scale(6 * MIB, MIB),
-            connections: &[1, 4, 8, 16],
+            connections: &[1, 4, 8, 16, AUTO],
         },
         Scenario {
             name: "No server limit",
             shows: "The server sends as fast as it can. This is the ceiling of the engine and the disk on this computer.",
             route: "range",
             size: scale(256 * MIB, 32 * MIB),
-            connections: &[1, 4, 8],
+            connections: &[1, 4, 8, AUTO],
         },
         Scenario {
             name: "Server without range support",
@@ -133,7 +135,10 @@ async fn run_once(tool: Tool, url: &str, dest: &Path, connections: usize) -> Opt
     let ok = match tool {
         Tool::Quorix => {
             let mut request = DownloadRequest::new(url, Target::File(dest.to_path_buf()));
-            request.connections = connections;
+            if connections > 0 {
+                request.connections = connections;
+                request.adaptive = false;
+            }
             request.http.use_system_proxy = false;
             let finalizing_since = std::sync::Mutex::new(None);
             let outcome = download(&request, &CancelToken::new(), &|event| {
@@ -274,7 +279,7 @@ fn print_report(args: &Args, scenarios: &[Scenario], rows: &[Row], tools: &[Tool
             println!(
                 "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 row.tool,
-                row.connections,
+                if row.connections == AUTO { "auto".to_string() } else { row.connections.to_string() },
                 speed(median(&row.speeds)),
                 speed(row.speeds.first().copied()),
                 speed(row.speeds.last().copied()),

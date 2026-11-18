@@ -28,9 +28,10 @@ struct Args {
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
 
-    /// Connections to use when the server allows it
-    #[arg(short = 'c', long, value_name = "N", default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=16))]
-    connections: u8,
+    /// Use exactly this many connections (1 to 16). Without this option Quorix
+    /// starts with 4 and adds more only while that makes the download faster.
+    #[arg(short = 'c', long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=16))]
+    connections: Option<u8>,
 
     /// SHA-256 checksum the file must match
     #[arg(long, value_name = "HEX", conflicts_with = "blake3")]
@@ -47,6 +48,11 @@ struct Args {
     /// Ignore a partial file from an earlier run and start from zero
     #[arg(long)]
     no_resume: bool,
+
+    /// Reuse saved data without reading it back and comparing it with the saved hashes.
+    /// Faster to continue a very large download. Not safe if another program changed the partial file.
+    #[arg(long)]
+    no_recheck: bool,
 
     /// Print nothing except errors
     #[arg(short, long)]
@@ -81,8 +87,12 @@ async fn run(args: Args) -> Result<ExitCode, Error> {
     let mut request = DownloadRequest::new(args.url, target_for(args.output));
     request.overwrite = args.overwrite;
     request.expected = expected;
-    request.connections = usize::from(args.connections);
+    if let Some(fixed) = args.connections {
+        request.connections = usize::from(fixed);
+        request.adaptive = false;
+    }
     request.resume = !args.no_resume;
+    request.verify_resume = !args.no_recheck;
 
     let cancel = CancelToken::new();
     let on_ctrl_c = cancel.clone();
@@ -136,7 +146,9 @@ fn target_for(output: Option<PathBuf>) -> Target {
 
 /// Draws one progress line on stderr when it is a terminal.
 struct Progress {
+    /// Draw the live progress line. Only when stderr is a terminal.
     enabled: bool,
+    quiet: bool,
     inner: Mutex<Meter>,
 }
 
@@ -151,10 +163,21 @@ struct Meter {
 impl Progress {
     fn new(quiet: bool) -> Self {
         let meter = Meter { started: Instant::now(), resumed: 0, connections: 1, last_draw: None };
-        Self { enabled: !quiet && std::io::stderr().is_terminal(), inner: Mutex::new(meter) }
+        Self { enabled: !quiet && std::io::stderr().is_terminal(), quiet, inner: Mutex::new(meter) }
     }
 
     fn handle(&self, event: Event) {
+        // A result of the check is a fact the user must see, also when the output goes to a file.
+        if let Event::Rechecked { verified, discarded } = event {
+            if discarded > 0 && !self.quiet {
+                eprintln!(
+                    "Checked the saved data: {} are good, {} did not pass the check and will be downloaded again.",
+                    human(verified),
+                    human(discarded)
+                );
+            }
+            return;
+        }
         if !self.enabled {
             return;
         }
@@ -189,6 +212,8 @@ impl Progress {
                 let _ = write!(err, "\r{line:<70}");
                 let _ = err.flush();
             }
+            Event::Connections(connections) => meter.connections = connections,
+            Event::Rechecked { .. } => {}
             Event::State(_) => {}
         }
     }

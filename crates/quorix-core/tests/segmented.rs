@@ -182,7 +182,11 @@ async fn pause_keeps_progress_and_the_next_run_continues_from_it() {
     let hits_before = server.hits();
     let done = finish(&server, dir.path()).await;
 
-    assert_eq!(done.resumed, downloaded, "every byte saved at pause time must be reused");
+    // Saved data is reused in whole blocks of 64 KiB, each checked against its hash.
+    // Bytes of a block that was still incomplete at the pause are downloaded again.
+    assert!(done.resumed > 0 && done.resumed <= downloaded, "resumed {} of {downloaded} saved", done.resumed);
+    assert_eq!(done.resumed % (64 * 1024), 0, "only whole verified blocks are reused");
+    assert!(downloaded - done.resumed < 4 * 2 * 64 * 1024, "at most the incomplete block of each connection is lost");
     assert_eq!(std::fs::read(&done.path).unwrap(), body(SIZE));
     assert_eq!(listing(dir.path()), [NAME]);
     let refetched = (server.hits() - hits_before) as u64 * 64 * 1024;
@@ -353,5 +357,70 @@ async fn a_failure_for_another_address_leaves_saved_progress_untouched() {
     assert_eq!(listing(dir.path()), [format!("{NAME}.qrxpart"), format!("{NAME}.qrxpart.state")]);
     let done = finish(&server, dir.path()).await;
     assert!(done.resumed > 0);
+    assert_eq!(std::fs::read(&done.path).unwrap(), body(SIZE));
+}
+
+#[tokio::test]
+async fn bytes_changed_in_the_partial_file_are_found_and_downloaded_again() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (downloaded, _) = pause_midway(&server, "range-slow", dir.path()).await;
+
+    // Another program damages the first block of the partial file while the download is paused.
+    let part = dir.path().join(format!("{NAME}.qrxpart"));
+    let mut bytes = std::fs::read(&part).unwrap();
+    for b in &mut bytes[1000..1100] {
+        *b ^= 0xff;
+    }
+    std::fs::write(&part, &bytes).unwrap();
+
+    let checked = Mutex::new(None);
+    server.stop_throttling();
+    let done = download(&pieces(server.url(&format!("/range-slow/{SIZE}")), dir.path()), &CancelToken::new(), &|event| {
+        if let Event::Rechecked { verified, discarded } = event {
+            *checked.lock().unwrap() = Some((verified, discarded));
+        }
+    })
+    .await
+    .unwrap()
+    .completed()
+    .unwrap();
+
+    let (verified, discarded) = checked.into_inner().unwrap().expect("saved data must be examined before reuse");
+    assert!(discarded >= 64 * 1024, "the damaged block must be rejected: {discarded}");
+    assert!(verified > 0 && verified + discarded == downloaded, "{verified} + {discarded} != {downloaded}");
+    assert_eq!(done.resumed, verified);
+    assert_eq!(std::fs::read(&done.path).unwrap(), body(SIZE), "the finished file must not contain the damaged bytes");
+}
+
+#[tokio::test]
+async fn a_partial_file_that_fails_the_check_completely_means_a_clean_restart() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    pause_midway(&server, "range-slow", dir.path()).await;
+
+    let part = dir.path().join(format!("{NAME}.qrxpart"));
+    let len = std::fs::metadata(&part).unwrap().len() as usize;
+    std::fs::write(&part, vec![0x42u8; len]).unwrap(); // right size, wrong content everywhere
+
+    let done = finish(&server, dir.path()).await;
+
+    assert_eq!(done.resumed, 0);
+    assert_eq!(std::fs::read(&done.path).unwrap(), body(SIZE));
+    assert_eq!(listing(dir.path()), [NAME]);
+}
+
+#[tokio::test]
+async fn the_recheck_can_be_skipped_and_then_saved_data_is_reused_as_it_is() {
+    let server = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (downloaded, _) = pause_midway(&server, "range-slow", dir.path()).await;
+
+    server.stop_throttling();
+    let mut r = pieces(server.url(&format!("/range-slow/{SIZE}")), dir.path());
+    r.verify_resume = false;
+    let done = complete(&r).await;
+
+    assert_eq!(done.resumed, downloaded, "without the check every saved byte is taken on trust");
     assert_eq!(std::fs::read(&done.path).unwrap(), body(SIZE));
 }

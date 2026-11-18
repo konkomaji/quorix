@@ -80,7 +80,7 @@ A slow connection holds a maximum of one part. The other connections continue.
 
 ### Rules that the engine keeps
 
-- One part has one owner at a time. Two connections do not write the same bytes.
+- One part has one owner at a time. Two connections write the same bytes only in a hedged request. Read the section "Hedged requests".
 - The engine accepts data only from a `206` answer with a `Content-Range` that agrees with the request.
 - A connection does not write out of its part, whatever the server sends.
 - If the server sends `200` to a request with `If-Range`, the file changed. The engine stops and deletes the data.
@@ -89,6 +89,43 @@ A slow connection holds a maximum of one part. The other connections continue.
 
 If a connection gets status 403, 429 or 503 while other connections operate, it gives its part back to the queue and stops.
 The download continues with fewer connections.
+
+## Adaptive number of connections
+
+The engine does not assume how many connections are useful. It measures.
+
+1. The transfer starts with 4 connections.
+2. The engine measures the bytes that arrive in a window of 0.8 seconds.
+3. The first window is ignored. Connections are still starting, and the speed reads low.
+4. After a measured window, the engine makes the number of connections two times larger.
+5. The window after a change is ignored. The new connections are still starting.
+6. If the next measured speed is 15% higher or more, the engine continues at step 4.
+7. If it is not, the engine goes back to the number before and stops the measurement.
+
+The engine counts bytes when they arrive from the network.
+It does not count them when they are written to the disk, because writes occur in large steps and make a short window inaccurate.
+
+A refusal from the server (status 403, 429 or 503) stops the increase for the remaining download.
+
+A fixed number of connections disables this mechanism.
+
+## Hedged requests
+
+A hedged request fetches bytes that a different connection is already fetching.
+
+When a connection has no part to take, it examines the parts that other connections hold.
+It requests the remaining bytes of a part again if one of these conditions is true:
+
+- The owner of the part made no progress for 2 seconds.
+- The owner is 4 times slower than this connection was on its last part, and the part is 0.5 seconds old or more.
+
+The connection that writes the last byte marks the part as complete. The other connection stops.
+
+Two connections then write the same bytes to the same positions.
+This is safe only if the bytes are identical. Thus the engine uses a hedged request only when the server sent a strong `ETag`, and each request has `If-Range` with that `ETag`.
+Without a strong `ETag`, no part is fetched two times.
+
+The progress counter adds only bytes that were not on the disk before. A hedged request does not make the progress larger than the file.
 
 ## Progress file and recovery
 
@@ -101,7 +138,26 @@ It contains:
 - The strong `ETag`.
 - The list of byte intervals that are on the disk.
 
+- The block size, and the BLAKE3 hash of each completed block.
+
 It does not contain the link.
+
+### Block hashes
+
+The engine divides the file into blocks of equal size. The last block can be smaller.
+The block size depends only on the file size. Thus a later run calculates the same value.
+
+| File size | Block size |
+|---|---|
+| Up to 256 MiB | 64 KiB |
+| 1 GiB | 256 KiB |
+| 50 GiB and larger | 16 MiB |
+
+The number of blocks is approximately 4096 at most. This keeps the progress file small.
+
+When a save occurs, the engine finds the blocks that are fully on the disk and have no hash.
+It reads each such block from the file and calculates the hash.
+The hash thus describes the content of the file. It does not describe what the engine sent to the file.
 
 ### Sequence of a save
 
@@ -124,6 +180,21 @@ The engine uses old data only if all these conditions are true:
 
 If one condition is false, the engine starts from zero.
 A weak `ETag` is not accepted as proof.
+
+### Check of saved data
+
+The conditions above show that the server did not change the file.
+They do not show that the temporary file on this computer is unchanged.
+Thus the engine examines the saved data before it uses it:
+
+1. Read each block that has a saved hash.
+2. Calculate the BLAKE3 hash of the block.
+3. If the hash agrees, keep the block.
+4. If the hash does not agree, or the block cannot be read, download the block again.
+
+Bytes that are not in a block with a saved hash are downloaded again.
+
+The caller can disable this check. Then the engine uses all saved data as it is.
 
 ## Retries
 

@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use quorix_http::{parse_url, Client, ClientConfig, Response, Url};
-use quorix_integrity::{Algorithm, Expected, Hasher};
-use quorix_state::{Checkpoint, Ranges};
+use std::collections::BTreeMap;
+
+use quorix_integrity::{blake3_hex, Algorithm, Expected, Hasher};
+use quorix_state::{block_range, Checkpoint, Ranges};
 use quorix_storage::{sanitize_file_name, state_path_for, PartFile};
 
 use crate::segmented::{self, Ended, Plan};
@@ -92,8 +94,16 @@ pub struct DownloadRequest {
     pub http: ClientConfig,
     /// Most connections to use at once, from 1 to 16.
     pub connections: usize,
+    /// Start with a few connections and let measurements decide how many to use, up to `connections`.
+    /// When false, `connections` are used from the start.
+    pub adaptive: bool,
+    /// A piece that made no progress for this long may be requested again by an idle connection.
+    pub hedge_after: Duration,
     /// Continue from a partial file left by an earlier run when that is provably safe.
     pub resume: bool,
+    /// Before reusing saved data, read it back and compare it with the saved block hashes.
+    /// Data that does not match is downloaded again. Turning this off trusts the partial file as it is.
+    pub verify_resume: bool,
     /// How temporary failures are retried.
     pub retry: RetryPolicy,
     /// How often confirmed progress is saved to disk.
@@ -103,7 +113,7 @@ pub struct DownloadRequest {
 }
 
 impl DownloadRequest {
-    /// A request with default settings: 4 connections, resume on, no overwrite, no checksum.
+    /// A request with default settings: adaptive connections up to 16, resume on, no overwrite, no checksum.
     pub fn new(url: impl Into<String>, target: Target) -> Self {
         Self {
             url: url.into(),
@@ -111,8 +121,11 @@ impl DownloadRequest {
             overwrite: false,
             expected: None,
             http: ClientConfig::default(),
-            connections: 4,
+            connections: MAX_CONNECTIONS,
+            adaptive: true,
+            hedge_after: Duration::from_secs(2),
             resume: true,
+            verify_resume: true,
             retry: RetryPolicy::default(),
             checkpoint_interval: Duration::from_secs(2),
             piece_size: None,
@@ -188,6 +201,15 @@ pub enum Event {
         /// Connections that will be used.
         connections: usize,
     },
+    /// Saved data from an earlier run was examined before reuse.
+    Rechecked {
+        /// Bytes that matched their saved hash and are reused.
+        verified: u64,
+        /// Bytes that did not match, or had no hash, and are downloaded again.
+        discarded: u64,
+    },
+    /// The engine changed how many connections it uses.
+    Connections(usize),
     /// Bytes written so far.
     Progress {
         /// Bytes written to the part file.
@@ -274,8 +296,11 @@ async fn run(request: &DownloadRequest, cancel: &CancelToken, life: &mut Lifecyc
         Inspected::Ranged { first, first_end, total } => {
             let strong = first.strong_etag().map(str::to_string);
             let identity = identity_of(&url);
-            let (part, done) = open_part(&dest, request, total, strong.as_deref(), &identity).await?;
+            let Opened { part, done, hashes, discarded } = open_part(&dest, request, total, strong.as_deref(), &identity).await?;
             let resumed = done.covered();
+            if resumed > 0 || discarded > 0 {
+                (life.sink)(Event::Rechecked { verified: resumed, discarded });
+            }
             let pieces = request.piece_size_for(total);
             // The first answer already holds the start of the file. Use it unless those bytes are on disk.
             let first = (resumed == 0).then_some((first, 0, first_end));
@@ -291,8 +316,12 @@ async fn run(request: &DownloadRequest, cancel: &CancelToken, life: &mut Lifecyc
                 first,
                 piece_size: pieces,
                 connections: request.connection_limit(),
+                adaptive: request.adaptive,
+                hedge_after: request.hedge_after,
                 retry: request.retry.clone(),
                 checkpoint_interval: request.checkpoint_interval,
+                block_size: block_size_for(total),
+                hashes,
             };
             (life.sink)(Event::Started { path: dest.clone(), total: Some(total), resumed, connections: plan.worker_count() });
             match segmented::run(plan, cancel, life).await {
@@ -402,34 +431,84 @@ fn identity_of(url: &Url) -> String {
     hasher.finalize_hex()
 }
 
+/// Size of the blocks a file of `total` bytes is hashed in.
+///
+/// Small enough that little saved data is thrown away when a block is
+/// incomplete, large enough that the list of hashes stays short: at most about
+/// 4096 blocks, between 64 KiB and 16 MiB each. It depends only on the file
+/// size, so a later run computes the same value.
+pub(crate) fn block_size_for(total: u64) -> u64 {
+    (total / 4096).max(1).next_power_of_two().clamp(64 * 1024, 16 * MIB)
+}
+
+/// A part file ready for the transfer.
+struct Opened {
+    part: PartFile,
+    /// Bytes that are on disk and may be relied on.
+    done: Ranges,
+    /// Hash of each block in `done`.
+    hashes: BTreeMap<u64, String>,
+    /// Saved bytes that were not accepted and will be downloaded again.
+    discarded: u64,
+}
+
 /// Opens the part file: the one left by an earlier run when it can be trusted, a fresh one otherwise.
 ///
-/// Resume policy (SOP 6.2). Old data is reused only when all of these hold:
+/// Resume policy (SOP 6.2). Old data is considered only when all of these hold:
 /// the caller allows resume; the server sent a strong `ETag`; a checkpoint
 /// exists, parses and is internally consistent; it names the same resource,
-/// size and `ETag`; and the part file is a regular file of exactly that size.
-/// Anything less and the download starts again from zero. A weak `ETag` or no
-/// `ETag` is never accepted as proof.
-async fn open_part(
-    dest: &Path,
-    request: &DownloadRequest,
-    total: u64,
-    strong_etag: Option<&str>,
-    identity: &str,
-) -> Result<(PartFile, Ranges), Error> {
+/// size, block size and `ETag`; and the part file is a regular file of exactly
+/// that size. A weak `ETag` or no `ETag` is never accepted as proof.
+///
+/// Then each saved block is read from the file and compared with its saved
+/// hash. Only blocks that match are reused. Bytes outside a matching block are
+/// downloaded again. So the result does not depend on the part file being
+/// untouched since the last run: it is checked, not assumed.
+async fn open_part(dest: &Path, request: &DownloadRequest, total: u64, strong_etag: Option<&str>, identity: &str) -> Result<Opened, Error> {
     if let (true, Some(etag)) = (request.resume, strong_etag) {
         let state_path = state_path_for(dest)?;
         let saved = tokio::task::spawn_blocking(move || Checkpoint::load(&state_path)).await.ok().flatten();
-        if let Some(saved) = saved.filter(|c| c.identity == identity && c.total == total && c.etag == etag) {
-            let done = saved.ranges();
-            if done.covered() > 0 {
+        let block_size = block_size_for(total);
+        let usable = |c: &Checkpoint| c.identity == identity && c.total == total && c.etag == etag && c.block_size() == block_size;
+        if let Some(saved) = saved.filter(usable) {
+            let claimed = saved.ranges().covered();
+            if claimed > 0 {
                 if let Some(part) = PartFile::reopen(dest, request.overwrite, total).await? {
-                    return Ok((part, done));
+                    let (done, hashes) = if request.verify_resume {
+                        verified_blocks(&part, &saved).await
+                    } else {
+                        (saved.ranges(), saved.blocks().iter().cloned().collect())
+                    };
+                    if done.covered() > 0 {
+                        let discarded = claimed - done.covered();
+                        return Ok(Opened { part, done, hashes, discarded });
+                    }
+                    drop(part); // nothing passed the check: start again with a fresh file
+                    let part = PartFile::create(dest, request.overwrite, Some(total)).await?;
+                    return Ok(Opened { part, done: Ranges::new(), hashes: BTreeMap::new(), discarded: claimed });
                 }
             }
         }
     }
-    Ok((PartFile::create(dest, request.overwrite, Some(total)).await?, Ranges::new()))
+    let part = PartFile::create(dest, request.overwrite, Some(total)).await?;
+    Ok(Opened { part, done: Ranges::new(), hashes: BTreeMap::new(), discarded: 0 })
+}
+
+/// Reads every block the checkpoint has a hash for and keeps the ones that still match.
+/// A block that cannot be read counts as not matching.
+async fn verified_blocks(part: &PartFile, saved: &Checkpoint) -> (Ranges, BTreeMap<u64, String>) {
+    let mut done = Ranges::new();
+    let mut hashes = BTreeMap::new();
+    for (index, expected) in saved.blocks() {
+        let (start, end) = block_range(*index, saved.block_size(), saved.total);
+        let Ok(data) = part.read_at(start, (end - start) as usize).await else { continue };
+        let actual = tokio::task::spawn_blocking(move || blake3_hex(&data)).await.unwrap_or_default();
+        if actual == *expected {
+            done.insert(start, end);
+            hashes.insert(*index, actual);
+        }
+    }
+    (done, hashes)
 }
 
 /// Sequential transfer: one answer, written from the start. Used when the
@@ -579,8 +658,23 @@ mod tests {
     }
 
     #[test]
+    fn block_size_keeps_the_hash_list_short_and_is_a_power_of_two() {
+        assert_eq!(block_size_for(1), 64 * 1024);
+        assert_eq!(block_size_for(200 * MIB), 64 * 1024);
+        assert_eq!(block_size_for(1024 * MIB), 256 * 1024);
+        assert_eq!(block_size_for(50 * 1024 * MIB), 16 * MIB);
+        assert_eq!(block_size_for(u64::MAX), 16 * MIB);
+        for total in [1, 70_000, 5 * MIB, 3 * 1024 * MIB, 40 * 1024 * MIB] {
+            let size = block_size_for(total);
+            assert!(size.is_power_of_two());
+            assert!(total.div_ceil(size) <= 4096 || size == 16 * MIB, "{total} bytes in {size} blocks");
+        }
+    }
+
+    #[test]
     fn piece_size_scales_with_the_file_and_stays_bounded() {
-        let request = DownloadRequest::new("https://example.com/f", Target::Directory(".".into()));
+        let mut request = DownloadRequest::new("https://example.com/f", Target::Directory(".".into()));
+        request.connections = 4;
         assert_eq!(request.piece_size_for(MIB), MIB / 4);
         assert_eq!(request.piece_size_for(16 * MIB), MIB);
         assert_eq!(request.piece_size_for(160 * MIB), 10 * MIB);

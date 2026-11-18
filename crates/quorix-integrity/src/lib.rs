@@ -104,6 +104,11 @@ impl Hasher {
     }
 }
 
+/// BLAKE3 hash of `data` as lowercase hexadecimal.
+pub fn blake3_hex(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);

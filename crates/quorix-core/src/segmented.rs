@@ -6,20 +6,33 @@
 //! each with a range request and write the bytes at their final offsets. A slow
 //! connection holds one piece at most, so the others keep the download moving.
 //!
+//! Two mechanisms adapt the transfer while it runs:
+//!
+//! - **Adaptive connection count.** The transfer starts with a few connections
+//!   and measures the total speed. It doubles the count while each doubling
+//!   gives a real gain, and goes back one step when it does not. A refusal from
+//!   the server ends the growth for good.
+//! - **Hedged requests.** When a worker has nothing left to take and another
+//!   worker's piece is stalled or much slower than its own, it requests the
+//!   rest of that piece as well. Whichever finishes first completes the piece.
+//!
 //! Invariants this module keeps:
-//! - A piece belongs to one worker at a time, so no two workers write the same bytes.
 //! - Bytes are accepted only from a `206` whose `Content-Range` matches the request.
-//! - A worker never writes outside the piece it holds, whatever the server sends.
+//! - A worker never writes outside the piece it works on, whatever the server sends.
+//! - A piece has one owner. Its bytes are written twice only by a hedge, and a
+//!   hedge is allowed only when a strong `ETag` pins every request to one
+//!   version of the file, so both writers hold identical bytes.
 //! - `written` only ever lists bytes that have been handed to the file.
 //! - A checkpoint only lists bytes that were synced to disk before it was saved.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use quorix_http::{Client, Response, Url};
-use quorix_state::{Checkpoint, Ranges};
+use quorix_integrity::blake3_hex;
+use quorix_state::{block_range, Checkpoint, Ranges};
 use quorix_storage::{PartFile, StorageError};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -30,6 +43,18 @@ use crate::{CancelToken, Error, Event, TaskState};
 
 /// Longest time received bytes may wait in memory before they are written.
 const MAX_BUFFER_AGE: Duration = Duration::from_millis(500);
+/// Connections an adaptive transfer starts with.
+const INITIAL_CONNECTIONS: usize = 4;
+/// Time over which the total speed is measured before the connection count is judged.
+const MEASURE_WINDOW: Duration = Duration::from_millis(800);
+/// A doubling of the connection count must raise the speed by this factor to be kept.
+const WORTHWHILE_GAIN: f64 = 1.15;
+/// A piece is hedged for slowness only when its owner is this many times slower than the idle worker was.
+const SLOW_FACTOR: u64 = 4;
+/// A piece younger than this has no meaningful speed yet.
+const MIN_SAMPLE_MS: u64 = 500;
+/// How often an idle worker looks for a piece to hedge.
+const IDLE_POLL: Duration = Duration::from_millis(100);
 
 /// Everything a segmented transfer needs.
 pub(crate) struct Plan {
@@ -47,9 +72,18 @@ pub(crate) struct Plan {
     /// The inspection answer, when its body can serve as the first piece: `(response, start, end)`.
     pub first: Option<(Response, u64, u64)>,
     pub piece_size: u64,
+    /// Most connections to use.
     pub connections: usize,
+    /// Start low and let measurements decide how many connections to use, up to `connections`.
+    pub adaptive: bool,
+    /// A piece with no progress for this long may be requested again by an idle worker.
+    pub hedge_after: Duration,
     pub retry: RetryPolicy,
     pub checkpoint_interval: Duration,
+    /// Size of the blocks that are hashed for the checkpoint.
+    pub block_size: u64,
+    /// Hashes of blocks already verified on disk, from an earlier run.
+    pub hashes: BTreeMap<u64, String>,
 }
 
 impl Plan {
@@ -68,10 +102,11 @@ impl Plan {
         pieces
     }
 
-    /// Connections that will really be used: never more than there are pieces.
+    /// Connections the transfer starts with: never more than there are pieces.
     pub fn worker_count(&self) -> usize {
         let work = self.pieces().len() + usize::from(self.first.is_some());
-        self.connections.min(work).max(1)
+        let wanted = if self.adaptive { self.connections.min(INITIAL_CONNECTIONS) } else { self.connections };
+        wanted.min(work).max(1)
     }
 }
 
@@ -98,8 +133,36 @@ enum Note {
     Flowing,
 }
 
+/// One piece being fetched. Shared between its owner and, at most, one hedging worker.
+struct Claim {
+    start: u64,
+    end: u64,
+    /// How far the owner has written.
+    position: AtomicU64,
+    /// Set by whoever writes the last byte of the piece. The other side stops when it sees it.
+    done: watch::Sender<bool>,
+    hedged: AtomicBool,
+    /// Milliseconds since the transfer started.
+    began_ms: u64,
+    progressed_ms: AtomicU64,
+}
+
+impl Claim {
+    fn is_done(&self) -> bool {
+        *self.done.borrow()
+    }
+
+    /// Average speed of the owner on this piece, in bytes per second.
+    fn rate(&self, now_ms: u64) -> u64 {
+        let bytes = self.position.load(Ordering::Relaxed).saturating_sub(self.start);
+        bytes * 1000 / now_ms.saturating_sub(self.began_ms).max(1)
+    }
+}
+
 struct Queue {
     pending: VecDeque<(u64, u64)>,
+    /// Pieces being fetched right now.
+    claims: Vec<Arc<Claim>>,
     /// Workers that may still take work. Changed only under the queue lock, so
     /// "the last worker left" and "work was handed back" cannot both happen.
     active: usize,
@@ -113,9 +176,22 @@ struct Shared {
     strong_etag: Option<String>,
     validator: Option<String>,
     retry: RetryPolicy,
+    hedge_after: Duration,
+    started: Instant,
     queue: Mutex<Queue>,
+    /// Connections the controller currently permits. A worker above this number leaves at its next piece boundary.
+    allowed: AtomicUsize,
+    /// Set when the server refused a connection. The controller never grows again after that.
+    refused: AtomicBool,
     written: Mutex<Ranges>,
+    block_size: u64,
+    /// BLAKE3 hash of every block that is complete and was read back from the file.
+    hashes: Mutex<BTreeMap<u64, String>>,
     downloaded: AtomicU64,
+    /// Bytes taken from the network by piece owners, counted as they arrive.
+    /// The controller measures speed with this: bytes reach the disk in large
+    /// steps, which is too coarse to judge a short window.
+    received: AtomicU64,
     /// Failures in a row with no bytes received in between, across all workers.
     failures: AtomicU32,
     fatal: Mutex<Option<Error>>,
@@ -132,6 +208,8 @@ enum Pumped {
     Done,
     Short,
     Stopped,
+    /// The other worker on this piece finished it.
+    Superseded,
 }
 
 enum Next {
@@ -139,7 +217,22 @@ enum Next {
     Leave,
 }
 
+enum Work {
+    /// A piece from the queue. The worker owns it.
+    Piece(Arc<Claim>),
+    /// Another worker's piece, to be fetched again from the given offset.
+    Hedge(Arc<Claim>, u64),
+    /// Nothing to take now, but a piece in flight may need a hedge later.
+    Wait,
+    /// Nothing left for this worker.
+    Leave,
+}
+
 impl Shared {
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
     /// Records the first fatal error and tells every worker to stop.
     fn fail(&self, error: Error) {
         lock(&self.fatal).get_or_insert(error);
@@ -150,6 +243,72 @@ impl Shared {
             }
             running
         });
+    }
+
+    fn claim(&self, queue: &mut Queue, start: u64, end: u64) -> Arc<Claim> {
+        let now = self.now_ms();
+        let claim = Arc::new(Claim {
+            start,
+            end,
+            position: AtomicU64::new(start),
+            done: watch::channel(false).0,
+            hedged: AtomicBool::new(false),
+            began_ms: now,
+            progressed_ms: AtomicU64::new(now),
+        });
+        queue.claims.push(Arc::clone(&claim));
+        claim
+    }
+
+    fn release(&self, claim: &Arc<Claim>) {
+        lock(&self.queue).claims.retain(|c| !Arc::ptr_eq(c, claim));
+    }
+
+    /// Decides what a worker does next. `my_rate` is the speed the worker
+    /// reached on its last piece, in bytes per second, or 0 when unknown.
+    fn take(&self, my_rate: u64) -> Work {
+        let mut queue = lock(&self.queue);
+        if queue.active > self.allowed.load(Ordering::Relaxed).max(1) {
+            queue.active -= 1;
+            return Work::Leave;
+        }
+        if let Some((start, end)) = queue.pending.pop_front() {
+            return Work::Piece(self.claim(&mut queue, start, end));
+        }
+
+        // Hedging writes the same bytes twice. That is only safe when every
+        // request is pinned to one version of the file by a strong ETag.
+        if self.strong_etag.is_none() {
+            queue.active -= 1;
+            return Work::Leave;
+        }
+        let now = self.now_ms();
+        let stall_ms = self.hedge_after.as_millis() as u64;
+        let mut open_claims = false;
+        let mut best: Option<(&Arc<Claim>, u64)> = None;
+        for claim in &queue.claims {
+            if claim.is_done() || claim.hedged.load(Ordering::Relaxed) {
+                continue;
+            }
+            open_claims = true;
+            let remaining = claim.end - claim.position.load(Ordering::Relaxed);
+            let stalled = now.saturating_sub(claim.progressed_ms.load(Ordering::Relaxed)) >= stall_ms;
+            let slow = my_rate > 0 && now.saturating_sub(claim.began_ms) >= MIN_SAMPLE_MS && claim.rate(now) * SLOW_FACTOR < my_rate;
+            if (stalled || slow) && remaining > 0 && best.is_none_or(|(_, most)| remaining > most) {
+                best = Some((claim, remaining));
+            }
+        }
+        match best {
+            Some((claim, _)) => {
+                claim.hedged.store(true, Ordering::Relaxed);
+                Work::Hedge(Arc::clone(claim), claim.position.load(Ordering::Relaxed))
+            }
+            None if open_claims => Work::Wait,
+            None => {
+                queue.active -= 1;
+                Work::Leave
+            }
+        }
     }
 
     /// Requests bytes `start..end` and checks that the answer is exactly that.
@@ -189,23 +348,45 @@ impl Shared {
     }
 
     /// Hands buffered bytes to the file and records them as written.
+    /// Only bytes that were not on disk before count as progress, so a hedge never inflates the total.
     async fn flush(&self, buffer: &mut Vec<u8>, position: &mut u64) -> Result<(), Error> {
         if buffer.is_empty() {
             return Ok(());
         }
         let length = buffer.len() as u64;
         *buffer = self.part.write_at(*position, std::mem::take(buffer)).await?;
-        lock(&self.written).insert(*position, *position + length);
+        let added = lock(&self.written).insert(*position, *position + length);
         *position += length;
-        self.downloaded.fetch_add(length, Ordering::Relaxed);
+        self.downloaded.fetch_add(added, Ordering::Relaxed);
         Ok(())
     }
 
+    /// Publishes the owner's progress on a piece, so idle workers can judge whether it needs a hedge.
+    fn report(&self, claim: &Claim, owner: bool, position: u64) {
+        if owner {
+            claim.position.store(position, Ordering::Relaxed);
+            claim.progressed_ms.store(self.now_ms(), Ordering::Relaxed);
+        }
+    }
+
     /// Reads a response body into the file, from `position` up to `end` and never beyond.
-    async fn pump(&self, response: &mut Response, position: &mut u64, end: u64, stop: &mut watch::Receiver<Stop>) -> Result<Pumped, Error> {
+    /// `owner` is true for the worker that owns `claim`; only the owner reports its position.
+    async fn pump(
+        &self,
+        response: &mut Response,
+        position: &mut u64,
+        end: u64,
+        claim: &Claim,
+        owner: bool,
+        stop: &mut watch::Receiver<Stop>,
+    ) -> Result<Pumped, Error> {
+        let mut finished = claim.done.subscribe();
         let mut buffer = Vec::with_capacity(WRITE_BUFFER.min((end - *position) as usize));
         let mut last_flush = Instant::now();
         loop {
+            if *finished.borrow() {
+                return Ok(Pumped::Superseded);
+            }
             let chunk = tokio::select! {
                 biased;
                 _ = stop.changed() => {
@@ -214,6 +395,14 @@ impl Shared {
                         self.flush(&mut buffer, position).await?;
                     }
                     return Ok(Pumped::Stopped);
+                }
+                _ = finished.changed() => return Ok(Pumped::Superseded),
+                // A connection that goes silent must not hold received bytes in memory.
+                _ = tokio::time::sleep(MAX_BUFFER_AGE), if !buffer.is_empty() => {
+                    self.flush(&mut buffer, position).await?;
+                    last_flush = Instant::now();
+                    self.report(claim, owner, *position);
+                    continue;
                 }
                 chunk = response.chunk() => chunk,
             };
@@ -229,12 +418,17 @@ impl Shared {
                 }
                 Ok(Some(bytes)) => {
                     let room = (end - *position - buffer.len() as u64) as usize;
-                    buffer.extend_from_slice(&bytes[..bytes.len().min(room)]);
+                    let taken = bytes.len().min(room);
+                    buffer.extend_from_slice(&bytes[..taken]);
+                    if owner {
+                        self.received.fetch_add(taken as u64, Ordering::Relaxed);
+                    }
                     let piece_full = *position + buffer.len() as u64 == end;
                     // On a slow link the buffer fills slowly. Flushing by age bounds what a crash can lose.
                     if buffer.len() >= WRITE_BUFFER || piece_full || last_flush.elapsed() >= MAX_BUFFER_AGE {
                         self.flush(&mut buffer, position).await?;
                         last_flush = Instant::now();
+                        self.report(claim, owner, *position);
                     }
                     if piece_full {
                         return Ok(Pumped::Done);
@@ -244,14 +438,57 @@ impl Shared {
         }
     }
 
-    /// Decides what a worker does after a failed attempt on `remaining`.
-    async fn after_failure(&self, error: Error, progressed: bool, remaining: (u64, u64), stop: &mut watch::Receiver<Stop>) -> Next {
+    /// Fetches the rest of another worker's piece. One attempt: a hedge that
+    /// fails is simply dropped, because the owner is still working on the piece.
+    async fn hedge(&self, claim: &Claim, from: u64, stop: &mut watch::Receiver<Stop>) {
+        let mut position = from;
+        let mut finished = claim.done.subscribe();
+        while position < claim.end && !claim.is_done() {
+            let opened = tokio::select! {
+                biased;
+                _ = stop.changed() => return,
+                _ = finished.changed() => return,
+                opened = self.open(position, claim.end) => opened,
+            };
+            let outcome = match opened {
+                Ok((mut response, range_end)) => self.pump(&mut response, &mut position, range_end, claim, false, stop).await,
+                Err(error) => Err(error),
+            };
+            match outcome {
+                Ok(Pumped::Done) => {}
+                Ok(Pumped::Stopped | Pumped::Superseded) => return,
+                // A changed file or a storage failure is real for the whole download, not only for the hedge.
+                Err(error @ (Error::ResourceChanged | Error::DiskFull | Error::Io(_))) => return self.fail(error),
+                Ok(Pumped::Short) | Err(_) => {
+                    claim.hedged.store(false, Ordering::Relaxed); // let another idle worker try later
+                    return;
+                }
+            }
+        }
+        if position == claim.end {
+            claim.done.send_replace(true);
+        }
+    }
+
+    /// Decides what a worker does after a failed attempt on the rest of its piece.
+    async fn after_failure(
+        &self,
+        error: Error,
+        progressed: bool,
+        claim: &Arc<Claim>,
+        position: u64,
+        stop: &mut watch::Receiver<Stop>,
+    ) -> Next {
         // A refusal while other connections are working usually means "too many
         // connections". Give the work back and continue with fewer (SOP 5.5).
         if matches!(error, Error::Http { status: 403 | 429 | 503, .. }) {
             let mut queue = lock(&self.queue);
             if queue.active > 1 {
-                queue.pending.push_front(remaining);
+                self.refused.store(true, Ordering::Relaxed);
+                queue.claims.retain(|c| !Arc::ptr_eq(c, claim));
+                if !claim.is_done() {
+                    queue.pending.push_front((position, claim.end));
+                }
                 queue.active -= 1;
                 return Next::Leave;
             }
@@ -270,13 +507,46 @@ impl Shared {
         }
     }
 
+    /// Hashes every block that is completely inside `on_disk` and has no hash yet.
+    ///
+    /// The block is read back from the file, so the hash describes what the
+    /// file holds, not what the engine believes it wrote. A later run compares
+    /// the file with these hashes before it trusts a single saved byte.
+    async fn hash_new_blocks(&self, on_disk: &Ranges) -> Result<(), Error> {
+        let mut todo = Vec::new();
+        {
+            let known = lock(&self.hashes);
+            for &(start, end) in on_disk.spans() {
+                let mut index = start.div_ceil(self.block_size);
+                loop {
+                    let (block_start, block_end) = block_range(index, self.block_size, self.total);
+                    if block_start >= block_end || block_end > end {
+                        break;
+                    }
+                    if !known.contains_key(&index) {
+                        todo.push((index, block_start, block_end));
+                    }
+                    index += 1;
+                }
+            }
+        }
+        for (index, start, end) in todo {
+            let data = self.part.read_at(start, (end - start) as usize).await?;
+            let hash = tokio::task::spawn_blocking(move || blake3_hex(&data)).await.map_err(|e| Error::Internal(e.to_string()))?;
+            lock(&self.hashes).insert(index, hash);
+        }
+        Ok(())
+    }
+
     /// Saves confirmed progress. The snapshot is taken before the sync, so
     /// every byte it lists was written before the sync started and is durable
     /// once the sync returns. Only then is the checkpoint replaced.
     async fn checkpoint(&self, identity: &str, etag: &str) -> Result<(), Error> {
         let snapshot = lock(&self.written).clone();
         self.part.sync_data().await?;
-        let checkpoint = Checkpoint::new(identity.to_string(), self.total, etag.to_string(), &snapshot);
+        self.hash_new_blocks(&snapshot).await?;
+        let hashes = lock(&self.hashes).clone();
+        let checkpoint = Checkpoint::new(identity.to_string(), self.total, etag.to_string(), &snapshot, self.block_size, &hashes);
         let path = self.part.state_path().to_path_buf();
         tokio::task::spawn_blocking(move || checkpoint.save(&path))
             .await
@@ -285,34 +555,44 @@ impl Shared {
     }
 }
 
-async fn worker(shared: Arc<Shared>, first: Option<(Response, u64, u64)>) {
+async fn worker(shared: Arc<Shared>, first: Option<(Response, Arc<Claim>)>) {
     let mut stop = shared.stop.subscribe();
     let mut carried = first;
+    let mut my_rate = 0u64;
     loop {
-        let (mut ready, mut position, end) = match carried.take() {
-            Some((response, start, end)) => (Some(response), start, end),
-            None => {
-                let mut queue = lock(&shared.queue);
-                match queue.pending.pop_front() {
-                    Some((start, end)) => (None, start, end),
-                    None => {
-                        queue.active -= 1;
-                        return;
+        let (mut ready, claim) = match carried.take() {
+            Some((response, claim)) => (Some(response), claim),
+            None => match shared.take(my_rate) {
+                Work::Piece(claim) => (None, claim),
+                Work::Hedge(claim, from) => {
+                    shared.hedge(&claim, from, &mut stop).await;
+                    continue;
+                }
+                Work::Wait => {
+                    tokio::select! {
+                        biased;
+                        _ = stop.changed() => return,
+                        _ = tokio::time::sleep(IDLE_POLL) => continue,
                     }
                 }
-            }
+                Work::Leave => return,
+            },
         };
 
-        while position < end {
+        let began = Instant::now();
+        let mut position = claim.start;
+        let mut finished = claim.done.subscribe();
+        while position < claim.end && !claim.is_done() {
             if *stop.borrow() != Stop::Run {
                 return;
             }
             let opened = match ready.take() {
-                Some(response) => Ok((response, end)),
+                Some(response) => Ok((response, claim.end)),
                 None => tokio::select! {
                     biased;
                     _ = stop.changed() => return,
-                    opened = shared.open(position, end) => opened,
+                    _ = finished.changed() => break,
+                    opened = shared.open(position, claim.end) => opened,
                 },
             };
             let failure = match opened {
@@ -320,23 +600,33 @@ async fn worker(shared: Arc<Shared>, first: Option<(Response, u64, u64)>) {
                 Ok((mut response, range_end)) => {
                     let _ = shared.notes.send(Note::Flowing);
                     let before = position;
-                    let pumped = shared.pump(&mut response, &mut position, range_end, &mut stop).await;
+                    let pumped = shared.pump(&mut response, &mut position, range_end, &claim, true, &mut stop).await;
                     let progressed = position > before;
                     if progressed {
                         shared.failures.store(0, Ordering::Relaxed);
                     }
                     match pumped {
                         Ok(Pumped::Done) => continue,
+                        Ok(Pumped::Superseded) => break,
                         Ok(Pumped::Stopped) => return,
                         Ok(Pumped::Short) => (Error::ConnectionClosed, progressed),
                         Err(error) => (error, progressed),
                     }
                 }
             };
-            match shared.after_failure(failure.0, failure.1, (position, end), &mut stop).await {
+            match shared.after_failure(failure.0, failure.1, &claim, position, &mut stop).await {
                 Next::Retry => {}
                 Next::Leave => return,
             }
+        }
+
+        if position == claim.end {
+            claim.done.send_replace(true);
+        }
+        shared.release(&claim);
+        let bytes = position - claim.start;
+        if bytes > 0 {
+            my_rate = bytes * 1000 / (began.elapsed().as_millis() as u64).max(1);
         }
     }
 }
@@ -346,6 +636,71 @@ fn poisons_partial_data(error: &Error) -> bool {
     matches!(error, Error::ResourceChanged | Error::Protocol(_) | Error::LengthMismatch { .. } | Error::Internal(_) | Error::Cancelled)
 }
 
+/// Finds the connection count worth using by measuring, not by assuming.
+struct Controller {
+    enabled: bool,
+    limit: usize,
+    /// Connection count before the last doubling, and the speed measured there.
+    previous: Option<(usize, f64)>,
+    window_started: Instant,
+    window_bytes: u64,
+    /// The first window of the transfer and the first after each change are not judged:
+    /// connections are still starting, so the speed reads low and the next window would look like a gain.
+    settling: bool,
+}
+
+enum Verdict {
+    Keep,
+    Grow(usize),
+    Shrink(usize),
+}
+
+impl Controller {
+    fn new(enabled: bool, limit: usize, bytes: u64) -> Self {
+        Self { enabled, limit, previous: None, window_started: Instant::now(), window_bytes: bytes, settling: true }
+    }
+
+    /// Call often. Returns a verdict once per measurement window.
+    fn judge(&mut self, current: usize, bytes: u64, refused: bool) -> Verdict {
+        if !self.enabled {
+            return Verdict::Keep;
+        }
+        if refused {
+            // The server drew the line. Respect it for the rest of the download.
+            self.enabled = false;
+            return Verdict::Keep;
+        }
+        let elapsed = self.window_started.elapsed();
+        if elapsed < MEASURE_WINDOW {
+            return Verdict::Keep;
+        }
+        let rate = (bytes - self.window_bytes) as f64 / elapsed.as_secs_f64();
+        self.window_started = Instant::now();
+        self.window_bytes = bytes;
+        if std::mem::take(&mut self.settling) {
+            return Verdict::Keep;
+        }
+
+        match self.previous {
+            Some((before, rate_before)) if rate < rate_before * WORTHWHILE_GAIN => {
+                // Twice the connections for no real gain: the limit is the network or the disk, not the server.
+                self.enabled = false;
+                Verdict::Shrink(before)
+            }
+            _ => {
+                let next = (current * 2).min(self.limit);
+                if next == current {
+                    self.enabled = false;
+                    return Verdict::Keep;
+                }
+                self.previous = Some((current, rate));
+                self.settling = true;
+                Verdict::Grow(next)
+            }
+        }
+    }
+}
+
 /// Runs the transfer until the file is complete, the caller stops it, or it fails.
 pub(crate) async fn run(mut plan: Plan, cancel: &CancelToken, life: &mut Lifecycle<'_>) -> Ended {
     let workers = plan.worker_count();
@@ -353,6 +708,7 @@ pub(crate) async fn run(mut plan: Plan, cancel: &CancelToken, life: &mut Lifecyc
     let first = plan.first.take();
     let resumed = plan.done.covered();
     let (identity, etag, interval, total) = (plan.identity, plan.strong_etag.clone(), plan.checkpoint_interval, plan.total);
+    let mut controller = Controller::new(plan.adaptive, plan.connections, 0);
 
     let (stop_tx, _) = watch::channel(Stop::Run);
     let (note_tx, mut notes) = mpsc::unbounded_channel();
@@ -364,9 +720,16 @@ pub(crate) async fn run(mut plan: Plan, cancel: &CancelToken, life: &mut Lifecyc
         strong_etag: plan.strong_etag,
         validator: plan.validator,
         retry: plan.retry,
-        queue: Mutex::new(Queue { pending, active: workers }),
+        hedge_after: plan.hedge_after,
+        started: Instant::now(),
+        queue: Mutex::new(Queue { pending, claims: Vec::new(), active: workers }),
+        allowed: AtomicUsize::new(workers),
+        refused: AtomicBool::new(false),
         written: Mutex::new(plan.done),
+        block_size: plan.block_size,
+        hashes: Mutex::new(plan.hashes),
         downloaded: AtomicU64::new(resumed),
+        received: AtomicU64::new(0),
         failures: AtomicU32::new(0),
         fatal: Mutex::new(None),
         stop: stop_tx,
@@ -374,7 +737,10 @@ pub(crate) async fn run(mut plan: Plan, cancel: &CancelToken, life: &mut Lifecyc
     });
 
     let mut tasks = JoinSet::new();
-    let mut first = first;
+    let mut first = first.map(|(response, start, end)| {
+        let claim = shared.claim(&mut lock(&shared.queue), start, end);
+        (response, claim)
+    });
     for _ in 0..workers {
         tasks.spawn(worker(Arc::clone(&shared), first.take()));
     }
@@ -410,7 +776,37 @@ pub(crate) async fn run(mut plan: Plan, cancel: &CancelToken, life: &mut Lifecyc
                 _ => {}
             },
             _ = ticker.tick() => {
-                (life.sink)(Event::Progress { downloaded: shared.downloaded.load(Ordering::Relaxed), total: Some(total) });
+                let bytes = shared.downloaded.load(Ordering::Relaxed);
+                (life.sink)(Event::Progress { downloaded: bytes, total: Some(total) });
+
+                let current = shared.allowed.load(Ordering::Relaxed);
+                let received = shared.received.load(Ordering::Relaxed);
+                match controller.judge(current, received, shared.refused.load(Ordering::Relaxed)) {
+                    Verdict::Keep => {}
+                    Verdict::Shrink(to) => {
+                        shared.allowed.store(to, Ordering::Relaxed);
+                        (life.sink)(Event::Connections(to));
+                    }
+                    Verdict::Grow(to) => {
+                        // Only start workers that have a piece waiting for them.
+                        let extra = {
+                            let mut queue = lock(&shared.queue);
+                            let extra = (to - current).min(queue.pending.len());
+                            queue.active += extra;
+                            extra
+                        };
+                        if extra > 0 && *shared.stop.borrow() == Stop::Run {
+                            shared.allowed.store(current + extra, Ordering::Relaxed);
+                            for _ in 0..extra {
+                                tasks.spawn(worker(Arc::clone(&shared), None));
+                            }
+                            (life.sink)(Event::Connections(current + extra));
+                        } else {
+                            lock(&shared.queue).active -= extra;
+                        }
+                    }
+                }
+
                 if let Some(etag) = etag.as_deref().filter(|_| last_checkpoint.elapsed() >= interval) {
                     last_checkpoint = Instant::now();
                     if let Err(e) = shared.checkpoint(&identity, etag).await {
@@ -457,4 +853,49 @@ pub(crate) async fn run(mut plan: Plan, cancel: &CancelToken, life: &mut Lifecyc
         };
     }
     Ended::Failed { error: Error::Internal(format!("the transfer ended with {downloaded} of {total} bytes and no error")), keep: false }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feeds the controller one finished measurement window with the given speed.
+    fn window(controller: &mut Controller, current: usize, bytes_per_second: u64, total: &mut u64) -> Verdict {
+        controller.window_started = Instant::now() - MEASURE_WINDOW;
+        *total += bytes_per_second * MEASURE_WINDOW.as_millis() as u64 / 1000;
+        controller.judge(current, *total, false)
+    }
+
+    #[test]
+    fn the_controller_grows_while_doubling_pays_and_steps_back_when_it_does_not() {
+        let mut c = Controller::new(true, 16, 0);
+        let mut total = 0;
+        assert!(matches!(window(&mut c, 4, 300_000, &mut total), Verdict::Keep), "start-up window is not judged, however slow it looks");
+        assert!(matches!(window(&mut c, 4, 1_000_000, &mut total), Verdict::Grow(8)), "first measurement: try more");
+        assert!(matches!(window(&mut c, 8, 2_000_000, &mut total), Verdict::Keep), "warm-up window is not judged");
+        assert!(matches!(window(&mut c, 8, 2_000_000, &mut total), Verdict::Grow(16)), "twice the speed: keep growing");
+        assert!(matches!(window(&mut c, 16, 2_100_000, &mut total), Verdict::Keep), "warm-up window is not judged");
+        assert!(matches!(window(&mut c, 16, 2_100_000, &mut total), Verdict::Shrink(8)), "5% more for twice the connections: go back");
+        assert!(matches!(window(&mut c, 8, 9_000_000, &mut total), Verdict::Keep), "settled for the rest of the download");
+    }
+
+    #[test]
+    fn the_controller_stops_at_the_limit_and_after_a_refusal() {
+        let mut c = Controller::new(true, 4, 0);
+        let mut total = 0;
+        assert!(matches!(window(&mut c, 4, 1_000_000, &mut total), Verdict::Keep), "start-up window");
+        assert!(matches!(window(&mut c, 4, 1_000_000, &mut total), Verdict::Keep), "already at the limit");
+
+        let mut c = Controller::new(true, 16, 0);
+        c.window_started = Instant::now() - MEASURE_WINDOW;
+        assert!(matches!(c.judge(4, 1_000_000, true), Verdict::Keep), "the server refused a connection");
+        assert!(matches!(window(&mut c, 4, 5_000_000, &mut total), Verdict::Keep), "and growth never resumes");
+    }
+
+    #[test]
+    fn a_fixed_connection_count_is_never_changed() {
+        let mut c = Controller::new(false, 16, 0);
+        let mut total = 0;
+        assert!(matches!(window(&mut c, 4, 1_000_000, &mut total), Verdict::Keep));
+    }
 }

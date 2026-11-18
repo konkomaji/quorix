@@ -55,18 +55,38 @@ No speed statement about Quorix is permitted without a published Quorix Bench re
 
 ### 2. Adaptive scheduler with hedged requests
 
-- The engine measures the speed of each connection.
-- The engine adds connections only while the total speed increases.
-- The engine removes connections when errors or slow speed show that the server has a limit.
-- Near the end of a download, the engine requests a slow part again on a fast connection. The first answer that is complete wins.
+Status: the first version is done.
 
-### 3. Hash tree for each part
+- The engine starts with 4 connections and measures the total speed.
+- The engine makes the number of connections two times larger while the speed increases by 15% or more.
+- If the speed does not increase, the engine goes back to the number before.
+- If the server refuses a connection, the engine stops the increase for that download.
+- If a part is on a connection that is 4 times slower than a free connection, or that made no progress for 2 seconds, the free connection requests the remaining bytes again. The first complete answer wins.
 
-- The engine calculates a BLAKE3 hash tree while the data arrives.
-- The progress file stores the hashes of the completed parts.
-- On resume, the engine examines each stored part against its hash.
+Still to do:
 
-Result: Quorix can prove that a resumed file is correct. A temporary file that a different program changed is found without a full checksum from the user.
+- Measure again later in a long download, because network conditions change.
+- Make the increase faster for short downloads.
+- Take the number of HTTP/2 streams into account, not only the number of connections.
+- Measure the behaviour on real networks with Quorix Bench.
+
+### 3. Block hashes for a proven resume
+
+Status: the first version is done.
+
+- The engine divides the file into blocks. There are approximately 4096 blocks at most.
+- When a block is complete and synchronized, the engine reads it from the disk and calculates a BLAKE3 hash.
+- The progress file stores the hash of each completed block.
+- On resume, the engine reads each saved block and compares the hash. Only blocks that agree are used again.
+
+Result: a resumed download does not depend on the temporary file being unchanged. Quorix examines it.
+
+Still to do:
+
+- Join the block hashes into a full hash tree with one root value.
+- Use the root value to compare a file with a trusted value from the source, when a source supplies one.
+- Show the progress of the check for very large files.
+- Calculate the hashes on more than one processor core.
 
 ### 4. Multipath transfer
 

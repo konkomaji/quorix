@@ -9,6 +9,7 @@
 //! to disk before the checkpoint was written. The caller enforces the order
 //! "write data, sync data, save checkpoint"; this crate makes the save atomic.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -16,9 +17,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// Checkpoint layout version. A file with another version is ignored.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 /// A checkpoint larger than this is treated as corrupt rather than read into memory.
-const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024;
+const MAX_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// A set of half-open byte intervals `[start, end)`, kept sorted, disjoint and merged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -46,10 +47,12 @@ impl Ranges {
     }
 
     /// Adds `[start, end)`, merging with anything it touches.
-    pub fn insert(&mut self, start: u64, end: u64) {
+    /// Returns how many of those bytes were not covered before.
+    pub fn insert(&mut self, start: u64, end: u64) -> u64 {
         if start >= end {
-            return;
+            return 0;
         }
+        let before = self.covered();
         let (mut start, mut end) = (start, end);
         let mut merged = Vec::with_capacity(self.spans.len() + 1);
         let mut placed = false;
@@ -71,6 +74,7 @@ impl Ranges {
             merged.push((start, end));
         }
         self.spans = merged;
+        self.covered() - before
     }
 
     /// Total number of bytes covered.
@@ -103,10 +107,23 @@ impl Ranges {
         gaps
     }
 
+    /// True when every byte of `[start, end)` is covered.
+    pub fn contains(&self, start: u64, end: u64) -> bool {
+        start >= end || self.spans.iter().any(|&(a, b)| a <= start && end <= b)
+    }
+
     /// The spans, sorted.
     pub fn spans(&self) -> &[(u64, u64)] {
         &self.spans
     }
+}
+
+/// Byte range `[start, end)` of block `index` in a file of `total` bytes cut
+/// into blocks of `block_size`. The last block may be shorter. A block past the
+/// end of the file is empty.
+pub fn block_range(index: u64, block_size: u64, total: u64) -> (u64, u64) {
+    let start = index.saturating_mul(block_size).min(total);
+    (start, start.saturating_add(block_size).min(total))
 }
 
 /// Saved progress of one download.
@@ -120,17 +137,32 @@ pub struct Checkpoint {
     /// Strong `ETag` of the version these bytes belong to.
     pub etag: String,
     done: Vec<(u64, u64)>,
+    /// Size of the blocks the file is cut into for hashing.
+    block_size: u64,
+    /// BLAKE3 hash of each complete block, as `(block index, lowercase hex)`, sorted by index.
+    blocks: Vec<(u64, String)>,
 }
 
 impl Checkpoint {
-    /// Creates a checkpoint for the given confirmed intervals.
-    pub fn new(identity: String, total: u64, etag: String, done: &Ranges) -> Self {
-        Self { format: FORMAT, identity, total, etag, done: done.spans().to_vec() }
+    /// Creates a checkpoint for the given confirmed intervals and block hashes.
+    pub fn new(identity: String, total: u64, etag: String, done: &Ranges, block_size: u64, blocks: &BTreeMap<u64, String>) -> Self {
+        let blocks = blocks.iter().map(|(index, hash)| (*index, hash.clone())).collect();
+        Self { format: FORMAT, identity, total, etag, done: done.spans().to_vec(), block_size, blocks }
     }
 
     /// The confirmed intervals.
     pub fn ranges(&self) -> Ranges {
         Ranges { spans: self.done.clone() }
+    }
+
+    /// Size of the blocks the hashes refer to.
+    pub fn block_size(&self) -> u64 {
+        self.block_size
+    }
+
+    /// Hash of each complete block, sorted by block index.
+    pub fn blocks(&self) -> &[(u64, String)] {
+        &self.blocks
     }
 
     /// Writes the checkpoint so that a crash leaves either the old file or the
@@ -159,10 +191,21 @@ impl Checkpoint {
         let mut bytes = Vec::with_capacity(meta.len() as usize);
         File::open(path).ok()?.take(MAX_CHECKPOINT_BYTES).read_to_end(&mut bytes).ok()?;
         let checkpoint: Checkpoint = serde_json::from_slice(&bytes).ok()?;
-        if checkpoint.format != FORMAT || checkpoint.total == 0 || checkpoint.etag.is_empty() {
+        if checkpoint.format != FORMAT || checkpoint.total == 0 || checkpoint.etag.is_empty() || checkpoint.block_size == 0 {
             return None;
         }
-        Ranges::from_spans(checkpoint.done.clone(), checkpoint.total)?;
+        let done = Ranges::from_spans(checkpoint.done.clone(), checkpoint.total)?;
+
+        // Every hash must name a real block that the checkpoint claims is fully on disk.
+        let mut previous = None;
+        for (index, hash) in &checkpoint.blocks {
+            let (start, end) = block_range(*index, checkpoint.block_size, checkpoint.total);
+            let well_formed = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if start >= end || !well_formed || !done.contains(start, end) || previous.is_some_and(|p| *index <= p) {
+                return None;
+            }
+            previous = Some(*index);
+        }
         Some(checkpoint)
     }
 }
@@ -186,6 +229,16 @@ mod tests {
         assert_eq!(ranges(&[(0, 5), (10, 20), (3, 12)]).spans(), [(0, 20)]);
         assert_eq!(ranges(&[(0, 5), (10, 20), (30, 40), (4, 31)]).spans(), [(0, 40)]);
         assert_eq!(ranges(&[(5, 5), (9, 3)]).spans(), []);
+    }
+
+    #[test]
+    fn insert_reports_only_the_bytes_that_were_new() {
+        let mut r = Ranges::new();
+        assert_eq!(r.insert(10, 20), 10);
+        assert_eq!(r.insert(10, 20), 0, "a repeat adds nothing");
+        assert_eq!(r.insert(15, 30), 10, "only the part beyond 20 is new");
+        assert_eq!(r.insert(0, 40), 20, "0..10 and 30..40");
+        assert_eq!(r.insert(7, 7), 0);
     }
 
     #[test]
@@ -236,17 +289,40 @@ mod tests {
         assert!(Ranges::from_spans(vec![(0, 21)], 20).is_none(), "past the end");
     }
 
+    fn hashes(indexes: &[u64]) -> BTreeMap<u64, String> {
+        indexes.iter().map(|i| (*i, format!("{i:064x}"))).collect()
+    }
+
+    #[test]
+    fn contains_needs_one_span_to_hold_the_whole_range() {
+        let r = ranges(&[(0, 10), (20, 30)]);
+        assert!(r.contains(0, 10) && r.contains(3, 7) && r.contains(20, 30));
+        assert!(!r.contains(5, 25), "the gap 10..20 is not covered");
+        assert!(!r.contains(29, 31));
+        assert!(r.contains(15, 15), "an empty range is always covered");
+    }
+
+    #[test]
+    fn blocks_tile_the_file_and_the_last_one_may_be_short() {
+        assert_eq!(block_range(0, 10, 25), (0, 10));
+        assert_eq!(block_range(2, 10, 25), (20, 25));
+        assert_eq!(block_range(3, 10, 25), (25, 25), "past the end: empty");
+        assert_eq!(block_range(u64::MAX, u64::MAX, 25), (25, 25), "no overflow");
+    }
+
     #[test]
     fn checkpoint_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.qrxpart.state");
-        let saved = Checkpoint::new("id".into(), 100, "\"v1\"".into(), &ranges(&[(0, 10), (50, 60)]));
+        let saved = Checkpoint::new("id".into(), 100, "\"v1\"".into(), &ranges(&[(0, 30), (50, 60)]), 10, &hashes(&[0, 2, 5]));
 
         saved.save(&path).unwrap();
         saved.save(&path).unwrap(); // replacing an existing checkpoint must work
 
         assert_eq!(Checkpoint::load(&path), Some(saved.clone()));
-        assert_eq!(saved.ranges().spans(), [(0, 10), (50, 60)]);
+        assert_eq!(saved.ranges().spans(), [(0, 30), (50, 60)]);
+        assert_eq!(saved.block_size(), 10);
+        assert_eq!(saved.blocks().iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 2, 5]);
         assert!(!dir.path().join("file.qrxpart.state.tmp").exists());
     }
 
@@ -256,18 +332,37 @@ mod tests {
         let path = dir.path().join("state");
         assert_eq!(Checkpoint::load(&path), None, "missing");
 
-        for bad in [
-            "",
-            "not json",
-            "{\"format\":1",
-            r#"{"format":2,"identity":"id","total":100,"etag":"e","done":[]}"#,
-            r#"{"format":1,"identity":"id","total":100,"etag":"e","done":[[50,10]]}"#,
-            r#"{"format":1,"identity":"id","total":100,"etag":"e","done":[[0,500]]}"#,
-            r#"{"format":1,"identity":"id","total":100,"etag":"","done":[]}"#,
-            r#"{"format":1,"identity":"id","total":0,"etag":"e","done":[]}"#,
-        ] {
-            fs::write(&path, bad).unwrap();
-            assert_eq!(Checkpoint::load(&path), None, "input {bad:?}");
+        let hash = "a".repeat(64);
+        let json = |format: u32, total: u64, etag: &str, done: &str, block_size: u64, blocks: &str| {
+            format!(
+                r#"{{"format":{format},"identity":"id","total":{total},"etag":"{etag}","done":{done},"block_size":{block_size},"blocks":{blocks}}}"#
+            )
+        };
+        let good = json(2, 100, "e", "[[0,30]]", 10, &format!(r#"[[0,"{hash}"],[2,"{hash}"]]"#));
+        fs::write(&path, &good).unwrap();
+        assert!(Checkpoint::load(&path).is_some(), "control: the well-formed one loads");
+
+        let bad = [
+            ("empty file", String::new()),
+            ("not json", "not json".to_string()),
+            ("cut short", good[..good.len() / 2].to_string()),
+            ("old format", json(1, 100, "e", "[[0,30]]", 10, "[]")),
+            ("reversed span", json(2, 100, "e", "[[50,10]]", 10, "[]")),
+            ("span past the end", json(2, 100, "e", "[[0,500]]", 10, "[]")),
+            ("no etag", json(2, 100, "", "[[0,30]]", 10, "[]")),
+            ("empty file size", json(2, 0, "e", "[]", 10, "[]")),
+            ("zero block size", json(2, 100, "e", "[[0,30]]", 0, "[]")),
+            ("hash for a block that is not on disk", json(2, 100, "e", "[[0,30]]", 10, &format!(r#"[[3,"{hash}"]]"#))),
+            ("hash for a block that is only partly on disk", json(2, 100, "e", "[[0,25]]", 10, &format!(r#"[[2,"{hash}"]]"#))),
+            ("hash for a block past the end", json(2, 100, "e", "[[0,100]]", 10, &format!(r#"[[10,"{hash}"]]"#))),
+            ("hash too short", json(2, 100, "e", "[[0,30]]", 10, r#"[[0,"abc"]]"#)),
+            ("hash not lowercase hex", json(2, 100, "e", "[[0,30]]", 10, &format!(r#"[[0,"{}"]]"#, "G".repeat(64)))),
+            ("blocks out of order", json(2, 100, "e", "[[0,30]]", 10, &format!(r#"[[2,"{hash}"],[0,"{hash}"]]"#))),
+            ("block listed twice", json(2, 100, "e", "[[0,30]]", 10, &format!(r#"[[1,"{hash}"],[1,"{hash}"]]"#))),
+        ];
+        for (what, text) in bad {
+            fs::write(&path, text).unwrap();
+            assert_eq!(Checkpoint::load(&path), None, "{what}");
         }
     }
 }

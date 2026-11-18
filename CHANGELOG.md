@@ -26,7 +26,17 @@ Quorix uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Local test server that makes faults on purpose.
 - Quorix Bench, a tool that measures speed and integrity against a local server.
 
+- Automatic mode for the number of connections. It starts with 4 and adds connections only while the measured speed increases.
+- Block hashes. The progress file stores a BLAKE3 hash for each completed block. Before saved data is used again, each block is read from the disk and compared.
+- Option `--no-recheck`, which uses saved data without the check.
+- Hedged requests. A free connection requests a slow or stopped part again, if the server sends a strong `ETag`.
+- Received data is written to the disk after a maximum of 0.5 seconds, also when the connection becomes silent.
+
 ### Changed
+
+- The format of the progress file is version 2. A progress file from an earlier build is ignored, and the download starts from zero.
+- Saved data is used again in full blocks only. Bytes of a block that was not complete are downloaded again.
+- The option `-c` now sets a fixed number of connections. Without it, Quorix uses the automatic mode with a maximum of 16.
 
 - The first request of a download asks for 256 KiB, not 1 MiB. On a slow server the large first part controlled the time of the full download.
 - The minimum size of a part is 256 KiB, not 1 MiB. Small files can use all the connections that the user sets.

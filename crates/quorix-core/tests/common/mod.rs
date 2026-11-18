@@ -15,6 +15,8 @@ pub fn request(url: String, dir: &Path) -> DownloadRequest {
     r.http.use_system_proxy = false;
     r.http.read_timeout = Duration::from_secs(5);
     r.retry.max_retries = 0;
+    r.adaptive = false;
+    r.connections = 4;
     r.retry.base_delay = Duration::from_millis(10);
     r.retry.max_delay = Duration::from_millis(40);
     r

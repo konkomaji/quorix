@@ -41,7 +41,10 @@ For planned work, read [ROADMAP.md](ROADMAP.md).
 **Transfer**
 
 - Quorix downloads files through HTTP and HTTPS.
-- Quorix uses 1 to 16 connections when the server supports byte ranges. The default is 4.
+- Quorix uses 1 to 16 connections when the server supports byte ranges.
+- In the automatic mode, Quorix starts with 4 connections. It measures the speed and adds connections only while the speed increases.
+- If more connections give no more speed, Quorix goes back to the smaller number.
+- If one connection is much slower than the others, or stops, a free connection requests the same part again. The connection that completes first is used.
 - Quorix uses one request when the server does not support byte ranges.
 - Quorix writes each part directly to its final position in the file.
 - Memory use for each connection has a fixed limit. It does not increase with the file size.
@@ -56,6 +59,9 @@ For planned work, read [ROADMAP.md](ROADMAP.md).
 - If there is no proof, Quorix starts the download again from zero.
 - Quorix does not mix data from two versions of a file.
 - Quorix ignores a damaged progress file.
+- Quorix calculates a BLAKE3 hash for each completed block of the file and saves the hashes.
+- Before Quorix uses saved data again, it reads each block from the disk and compares the hash. A block that does not agree is downloaded again.
+- Thus Quorix finds saved data that a different program changed, or that the disk damaged.
 
 **Correctness**
 
@@ -96,9 +102,14 @@ The extension is in [`extensions/chromium`](extensions/chromium). It is for Chro
 
 - To resume, the server must send a strong `ETag`. If it does not, a stopped download starts again from zero.
 - You cannot pause or resume a download from a server that does not support byte ranges.
-- If a different program changes the temporary file, Quorix finds the change only when you supply a checksum.
+- Quorix reuses saved data in full blocks only. The bytes of a block that was not complete are downloaded again. A block is 64 KiB for a file smaller than 256 MiB, and a maximum of 16 MiB for a very large file.
+- The check of saved data reads all the saved data from the disk. For a very large file this takes time. The option `--no-recheck` disables the check.
+- If a different program changes the temporary file while Quorix runs, Quorix finds the change only when you supply a checksum.
 - The redirect check does not find a public host name that points to a private address.
 - Quorix reads `Retry-After` as a number of seconds. It ignores the date format.
+- The automatic mode is slow to add connections on short downloads. Use `-c` to set a fixed number.
+- After the automatic mode has selected a number of connections, it does not measure again during that download.
+- A connection requests a part again only if the server sends a strong `ETag`.
 - Quorix does not examine the free disk space before a download starts.
 - The speed measurements are from a local server only. There are no measurements on real networks. Read [Measure](#measure).
 
@@ -142,11 +153,12 @@ quorix https://example.com/file.zip -o downloads/ -c 8 --sha256 <hex>
 | Option | Function |
 |---|---|
 | `-o`, `--output <PATH>` | Sets the file or the folder for the download. The default is the current folder. |
-| `-c`, `--connections <N>` | Sets the maximum number of connections, from 1 to 16. The default is 4. |
+| `-c`, `--connections <N>` | Uses exactly this number of connections, from 1 to 16. Without this option, Quorix uses the automatic mode. |
 | `--sha256 <HEX>` | Gives the SHA-256 checksum that the file must have. |
 | `--blake3 <HEX>` | Gives the BLAKE3 checksum that the file must have. |
 | `--overwrite` | Replaces the destination file if it exists. |
 | `--no-resume` | Ignores the saved progress and starts from zero. |
+| `--no-recheck` | Uses the saved data without the hash check. Do not use it if a different program can change the temporary file. |
 | `-q`, `--quiet` | Shows only errors. |
 | `-h`, `--help` | Shows the help text. |
 
@@ -170,7 +182,7 @@ quorix https://example.com/file.zip -o downloads/ -c 8 --sha256 <hex>
 | File | Purpose |
 |---|---|
 | `<name>.qrxpart` | The temporary file. It holds the data until the download is complete. |
-| `<name>.qrxpart.state` | The progress file. It lists the parts of the file that are on the disk. |
+| `<name>.qrxpart.state` | The progress file. It lists the parts of the file that are on the disk, and the hash of each completed block. |
 
 Quorix deletes these two files when the download is complete.
 
@@ -260,8 +272,13 @@ It is from one computer with Windows, 4 logical processors, and 5 runs for each 
 | Quorix | 4 | 1.0 |
 | Quorix | 8 | 2.0 |
 | Quorix | 16 | 2.9 |
+| Quorix | automatic | 1.5 |
 
 More connections give more speed when the server limits each connection. This is the condition where a download manager helps.
+
+The automatic mode was slower than 16 fixed connections in this test.
+The file is small, and the download was complete before the automatic mode had added all connections.
+The automatic mode needs 1.6 seconds for each increase, because it measures before it changes.
 
 **A local server with no limit:** `curl` was faster than Quorix in these runs.
 The cause is known. Quorix synchronizes the file to the disk before it reports that the download is complete. `curl` does not.

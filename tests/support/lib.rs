@@ -31,6 +31,9 @@
 //! | `/range-badcr/<n>` | `Content-Range` is shifted by one byte |
 //! | `/range-one/<n>` | 403 for a ranged request while another one is being served |
 //! | `/range-503/<n>` | the second and third requests get 503, the rest are correct |
+//! | `/range-lag/<n>` | the first connection is very slow, later ones are fast |
+//! | `/range-stall1/<n>` | the first connection sends half its range, then goes silent |
+//! | `/range-shared/<n>` | one speed limit shared by all connections |
 //! | `/range-weak/<n>` | throttled like `range-slow`, but the `ETag` is weak |
 
 use std::net::SocketAddr;
@@ -62,6 +65,8 @@ pub fn body_of_version(len: usize, version: u32) -> Vec<u8> {
 
 #[derive(Default)]
 struct State {
+    /// Held while one connection sends, on the route with a limit shared by all connections.
+    gate: tokio::sync::Mutex<()>,
     unthrottled: AtomicU32,
     version: AtomicU32,
     hits: AtomicU32,
@@ -185,9 +190,8 @@ async fn serve(mut stream: TcpStream, state: &State) -> std::io::Result<()> {
             send(&mut stream, "200 OK", &headers, &body(16)).await
         }
         "range-ignore" => send(&mut stream, "200 OK", &[length(n), ("Accept-Ranges", "bytes".into())], &body(n)).await,
-        "range" | "range-slow" | "range-half" | "range-badcr" | "range-one" | "range-503" | "range-weak" => {
-            ranged(&mut stream, state, route, n, &request, hit).await
-        }
+        "range" | "range-slow" | "range-half" | "range-badcr" | "range-one" | "range-503" | "range-weak" | "range-lag" | "range-stall1"
+        | "range-shared" => ranged(&mut stream, state, route, n, &request, hit).await,
         _ => send(&mut stream, "404 Not Found", &[length(0)], b"").await,
     }
 }
@@ -229,6 +233,41 @@ async fn ranged(stream: &mut TcpStream, state: &State, route: &str, n: usize, re
     let slice = &data[..];
     let result = match route {
         "range-half" => send(stream, "206 Partial Content", &headers, &slice[..slice.len().div_ceil(2)]).await,
+        // The first connection is very slow. Every later one is fast.
+        "range-lag" if hit == 1 => {
+            send(stream, "206 Partial Content", &headers, b"").await?;
+            let mut result = Ok(());
+            for piece in slice.chunks(512) {
+                result = stream.write_all(piece).await;
+                if result.is_err() {
+                    break;
+                }
+                let _ = stream.flush().await;
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            result
+        }
+        // The first connection sends half of its range and then goes silent.
+        "range-stall1" if hit == 1 => {
+            send(stream, "206 Partial Content", &headers, &slice[..slice.len() / 2]).await?;
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            Ok(())
+        }
+        // One speed limit for the whole server: more connections bring no more speed.
+        "range-shared" => {
+            send(stream, "206 Partial Content", &headers, b"").await?;
+            let mut result = Ok(());
+            for piece in slice.chunks(8192) {
+                let _turn = state.gate.lock().await;
+                result = stream.write_all(piece).await;
+                if result.is_err() {
+                    break;
+                }
+                let _ = stream.flush().await;
+                tokio::time::sleep(Duration::from_millis(4)).await;
+            }
+            result
+        }
         "range-slow" | "range-one" | "range-weak" if state.unthrottled.load(Ordering::SeqCst) == 0 => {
             send(stream, "206 Partial Content", &headers, b"").await?;
             let mut result = Ok(());

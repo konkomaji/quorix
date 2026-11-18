@@ -180,6 +180,17 @@ impl PartFile {
         .await
     }
 
+    /// Reads exactly `len` bytes at `offset`.
+    pub async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, StorageError> {
+        let file = Arc::clone(&self.file);
+        blocking(move || {
+            let mut data = vec![0u8; len];
+            read_exact_at(&file, &mut data, offset)?;
+            Ok(data)
+        })
+        .await
+    }
+
     /// Forces written data to the disk. A checkpoint may only list bytes written before this returned.
     pub async fn sync_data(&self) -> Result<(), StorageError> {
         let file = Arc::clone(&self.file);
@@ -257,6 +268,28 @@ fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> io::Result<()>
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buffer.is_empty() {
+        match file.seek_read(buffer, offset) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buffer = &mut buffer[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buffer, offset)
 }
 
 #[cfg(unix)]
@@ -401,6 +434,18 @@ mod tests {
         part.sync_data().await.unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
 
+        part.discard().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reads_back_exactly_what_was_written_at_an_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = PartFile::create(&dir.path().join("file.bin"), false, Some(12)).await.unwrap();
+        part.write_at(4, b"abcdef".to_vec()).await.unwrap();
+
+        assert_eq!(part.read_at(4, 6).await.unwrap(), b"abcdef");
+        assert_eq!(part.read_at(0, 4).await.unwrap(), [0, 0, 0, 0], "bytes never written read as zero");
+        assert!(part.read_at(8, 100).await.is_err(), "a read past the end is an error, not a short answer");
         part.discard().await.unwrap();
     }
 

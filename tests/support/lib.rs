@@ -45,6 +45,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+/// Total speed of the `range-shared` route, for all its connections together.
+const SHARED_LIMIT_BYTES_PER_SECOND: f64 = 600_000.0;
+
 /// Deterministic test payload of `len` bytes. Not a repeating single byte, so
 /// truncation, duplication and reordering all change the content.
 pub fn body(len: usize) -> Vec<u8> {
@@ -66,7 +69,7 @@ pub fn body_of_version(len: usize, version: u32) -> Vec<u8> {
 #[derive(Default)]
 struct State {
     /// Held while one connection sends, on the route with a limit shared by all connections.
-    gate: tokio::sync::Mutex<()>,
+    gate: tokio::sync::Mutex<Option<(tokio::time::Instant, u64)>>,
     unthrottled: AtomicU32,
     version: AtomicU32,
     hits: AtomicU32,
@@ -258,13 +261,18 @@ async fn ranged(stream: &mut TcpStream, state: &State, route: &str, n: usize, re
             send(stream, "206 Partial Content", &headers, b"").await?;
             let mut result = Ok(());
             for piece in slice.chunks(8192) {
-                let _turn = state.gate.lock().await;
+                // The limit follows the clock, not the length of a sleep, so it is the
+                // same on systems whose timers have different precision.
+                let mut budget = state.gate.lock().await;
+                let (since, sent) = budget.get_or_insert_with(|| (tokio::time::Instant::now(), 0));
                 result = stream.write_all(piece).await;
                 if result.is_err() {
                     break;
                 }
                 let _ = stream.flush().await;
-                tokio::time::sleep(Duration::from_millis(4)).await;
+                *sent += piece.len() as u64;
+                let due = *since + Duration::from_secs_f64(*sent as f64 / SHARED_LIMIT_BYTES_PER_SECOND);
+                tokio::time::sleep_until(due).await;
             }
             result
         }

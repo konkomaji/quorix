@@ -26,7 +26,8 @@ fn pieces(url: String, dir: &Path) -> DownloadRequest {
     r
 }
 
-/// Starts a download on the slow route and pauses it once some bytes are on disk.
+/// Starts a download and pauses it once some bytes are on disk.
+/// The route stops sending at 40% of the file, so the download cannot finish before the pause.
 async fn pause_midway(server: &TestServer, route: &str, dir: &Path) -> (u64, u64) {
     let cancel = CancelToken::new();
     let r = pieces(server.url(&format!("/{route}/{SIZE}")), dir);
@@ -47,7 +48,7 @@ async fn pause_midway(server: &TestServer, route: &str, dir: &Path) -> (u64, u64
 /// Runs the same address again, at full speed, and expects a complete file.
 async fn finish(server: &TestServer, dir: &Path) -> quorix_core::Completed {
     server.stop_throttling();
-    complete(&pieces(server.url(&format!("/range-slow/{SIZE}")), dir)).await
+    complete(&pieces(server.url(&format!("/range-hold/{SIZE}")), dir)).await
 }
 
 #[tokio::test]
@@ -170,7 +171,7 @@ async fn pause_keeps_progress_and_the_next_run_continues_from_it() {
     let server = TestServer::start().await;
     let dir = tempfile::tempdir().unwrap();
 
-    let (downloaded, total) = pause_midway(&server, "range-slow", dir.path()).await;
+    let (downloaded, total) = pause_midway(&server, "range-hold", dir.path()).await;
     assert_eq!(total, SIZE as u64);
     assert!(downloaded > 0 && downloaded < total);
     assert_eq!(
@@ -197,7 +198,7 @@ async fn pause_keeps_progress_and_the_next_run_continues_from_it() {
 async fn a_file_that_changed_on_the_server_is_never_mixed_with_old_data() {
     let server = TestServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    pause_midway(&server, "range-slow", dir.path()).await;
+    pause_midway(&server, "range-hold", dir.path()).await;
 
     server.set_version(2); // same address, same size, different content
     let done = finish(&server, dir.path()).await;
@@ -210,6 +211,7 @@ async fn a_file_that_changed_on_the_server_is_never_mixed_with_old_data() {
 async fn a_change_during_the_download_stops_it_and_keeps_nothing() {
     let server = TestServer::start().await;
     let dir = tempfile::tempdir().unwrap();
+    // Not the holding route: new requests must keep coming, so one of them meets the changed file.
     let r = pieces(server.url(&format!("/range-slow/{SIZE}")), dir.path());
 
     let outcome = download(&r, &CancelToken::new(), &|event| {
@@ -227,7 +229,7 @@ async fn a_change_during_the_download_stops_it_and_keeps_nothing() {
 async fn a_crash_mid_download_is_recovered_from_the_last_checkpoint() {
     let server = TestServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    let r = pieces(server.url(&format!("/range-slow/{SIZE}")), dir.path());
+    let r = pieces(server.url(&format!("/range-hold/{SIZE}")), dir.path());
 
     // Dropping the future is the closest a test gets to killing the process:
     // no cleanup code runs, only what is already on disk survives.
@@ -279,7 +281,7 @@ async fn a_damaged_checkpoint_or_part_file_means_a_clean_restart() {
         // A fresh server each time: finishing removes the speed limit, and the next pause needs it back.
         let server = TestServer::start().await;
         let dir = tempfile::tempdir().unwrap();
-        pause_midway(&server, "range-slow", dir.path()).await;
+        pause_midway(&server, "range-hold", dir.path()).await;
         damage(dir.path(), &state, &part);
 
         let done = finish(&server, dir.path()).await;
@@ -294,9 +296,9 @@ async fn a_damaged_checkpoint_or_part_file_means_a_clean_restart() {
 async fn resume_can_be_switched_off() {
     let server = TestServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    pause_midway(&server, "range-slow", dir.path()).await;
+    pause_midway(&server, "range-hold", dir.path()).await;
     server.stop_throttling();
-    let mut r = pieces(server.url(&format!("/range-slow/{SIZE}")), dir.path());
+    let mut r = pieces(server.url(&format!("/range-hold/{SIZE}")), dir.path());
     r.resume = false;
 
     let done = complete(&r).await;
@@ -310,7 +312,8 @@ async fn a_weak_etag_is_not_accepted_as_proof_for_resume() {
     let server = TestServer::start().await;
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancelToken::new();
-    let r = pieces(server.url(&format!("/range-weak/{SIZE}")), dir.path());
+    // Large enough that the download cannot finish before the pause: about 3 seconds at the server's limit.
+    let r = pieces(server.url("/range-weak/4000000"), dir.path());
 
     // Several connections still work. But a pause cannot promise a safe
     // continuation without a strong validator, so it must keep nothing and say so.
@@ -330,7 +333,7 @@ async fn cancelling_a_segmented_download_keeps_nothing() {
     let server = TestServer::start().await;
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancelToken::new();
-    let r = pieces(server.url(&format!("/range-slow/{SIZE}")), dir.path());
+    let r = pieces(server.url(&format!("/range-hold/{SIZE}")), dir.path());
 
     let outcome = download(&r, &cancel, &|event| {
         if matches!(event, Event::Progress { downloaded, .. } if downloaded > 100_000) {
@@ -347,7 +350,7 @@ async fn cancelling_a_segmented_download_keeps_nothing() {
 async fn a_failure_for_another_address_leaves_saved_progress_untouched() {
     let server = TestServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    pause_midway(&server, "range-slow", dir.path()).await;
+    pause_midway(&server, "range-hold", dir.path()).await;
 
     let mut elsewhere = pieces(server.url(&format!("/missing/{SIZE}")), dir.path());
     elsewhere.target = quorix_core::Target::File(dir.path().join(NAME));
@@ -364,7 +367,7 @@ async fn a_failure_for_another_address_leaves_saved_progress_untouched() {
 async fn bytes_changed_in_the_partial_file_are_found_and_downloaded_again() {
     let server = TestServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    let (downloaded, _) = pause_midway(&server, "range-slow", dir.path()).await;
+    let (downloaded, _) = pause_midway(&server, "range-hold", dir.path()).await;
 
     // Another program damages the first block of the partial file while the download is paused.
     let part = dir.path().join(format!("{NAME}.qrxpart"));
@@ -376,7 +379,7 @@ async fn bytes_changed_in_the_partial_file_are_found_and_downloaded_again() {
 
     let checked = Mutex::new(None);
     server.stop_throttling();
-    let done = download(&pieces(server.url(&format!("/range-slow/{SIZE}")), dir.path()), &CancelToken::new(), &|event| {
+    let done = download(&pieces(server.url(&format!("/range-hold/{SIZE}")), dir.path()), &CancelToken::new(), &|event| {
         if let Event::Rechecked { verified, discarded } = event {
             *checked.lock().unwrap() = Some((verified, discarded));
         }
@@ -397,7 +400,7 @@ async fn bytes_changed_in_the_partial_file_are_found_and_downloaded_again() {
 async fn a_partial_file_that_fails_the_check_completely_means_a_clean_restart() {
     let server = TestServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    pause_midway(&server, "range-slow", dir.path()).await;
+    pause_midway(&server, "range-hold", dir.path()).await;
 
     let part = dir.path().join(format!("{NAME}.qrxpart"));
     let len = std::fs::metadata(&part).unwrap().len() as usize;
@@ -414,10 +417,10 @@ async fn a_partial_file_that_fails_the_check_completely_means_a_clean_restart() 
 async fn the_recheck_can_be_skipped_and_then_saved_data_is_reused_as_it_is() {
     let server = TestServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    let (downloaded, _) = pause_midway(&server, "range-slow", dir.path()).await;
+    let (downloaded, _) = pause_midway(&server, "range-hold", dir.path()).await;
 
     server.stop_throttling();
-    let mut r = pieces(server.url(&format!("/range-slow/{SIZE}")), dir.path());
+    let mut r = pieces(server.url(&format!("/range-hold/{SIZE}")), dir.path());
     r.verify_resume = false;
     let done = complete(&r).await;
 

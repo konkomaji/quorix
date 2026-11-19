@@ -26,7 +26,8 @@
 //! | Path | Behaviour |
 //! |---|---|
 //! | `/range/<n>` | correct |
-//! | `/range-slow/<n>` | correct, throttled to a few hundred KiB per second per connection |
+//! | `/range-slow/<n>` | correct, each connection limited to 300 kB/s |
+//! | `/range-hold/<n>` | like `range-slow`, and it stops sending at 40% of the file until `stop_throttling()` is called |
 //! | `/range-half/<n>` | sends only the first half of each requested range, then closes |
 //! | `/range-badcr/<n>` | `Content-Range` is shifted by one byte |
 //! | `/range-one/<n>` | 403 for a ranged request while another one is being served |
@@ -47,6 +48,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+/// Speed of one connection on the slow routes.
+const SLOW_BYTES_PER_SECOND: f64 = 300_000.0;
+/// Speed of the first connection on the `range-lag` route.
+const LAG_BYTES_PER_SECOND: f64 = 12_000.0;
 /// Speed of one limit on the `range-shared` and `range-peraddr` routes.
 const SHARED_LIMIT_BYTES_PER_SECOND: f64 = 600_000.0;
 
@@ -80,6 +85,8 @@ struct State {
     /// Every client address that sent a request.
     peers: Mutex<BTreeSet<IpAddr>>,
     unthrottled: AtomicU32,
+    /// Bytes sent so far on the route that holds at 40%.
+    held: std::sync::atomic::AtomicU64,
     version: AtomicU32,
     hits: AtomicU32,
     serving: AtomicU32,
@@ -120,8 +127,9 @@ impl TestServer {
         self.state.version.store(version, Ordering::SeqCst);
     }
 
-    /// Removes the speed limit from the throttled routes, so a test can pause
-    /// on a slow server and finish quickly on the very same address.
+    /// Removes the speed limit from the throttled routes and releases the route
+    /// that holds at 40%, so a test can interrupt a download and then finish it
+    /// quickly on the very same address.
     pub fn stop_throttling(&self) {
         self.state.unthrottled.store(1, Ordering::SeqCst);
     }
@@ -208,8 +216,8 @@ async fn serve(mut stream: TcpStream, state: &State, peer: IpAddr) -> std::io::R
             send(&mut stream, "200 OK", &headers, &body(16)).await
         }
         "range-ignore" => send(&mut stream, "200 OK", &[length(n), ("Accept-Ranges", "bytes".into())], &body(n)).await,
-        "range" | "range-slow" | "range-half" | "range-badcr" | "range-one" | "range-503" | "range-weak" | "range-lag" | "range-stall1"
-        | "range-shared" | "range-peraddr" => ranged(&mut stream, state, route, n, &request, hit, peer).await,
+        "range" | "range-slow" | "range-hold" | "range-half" | "range-badcr" | "range-one" | "range-503" | "range-weak" | "range-lag"
+        | "range-stall1" | "range-shared" | "range-peraddr" => ranged(&mut stream, state, route, n, &request, hit, peer).await,
         _ => send(&mut stream, "404 Not Found", &[length(0)], b"").await,
     }
 }
@@ -236,7 +244,7 @@ async fn ranged(
     let Some((start, end)) = requested_range(request, n).filter(|_| version_matches) else {
         let whole = body_of_version(n, version);
         let headers = [length(n), ("ETag", etag)];
-        if matches!(route, "range-slow" | "range-weak") && state.unthrottled.load(Ordering::SeqCst) == 0 {
+        if matches!(route, "range-slow" | "range-hold" | "range-weak") && state.unthrottled.load(Ordering::SeqCst) == 0 {
             send(stream, "200 OK", &headers, b"").await?;
             return trickle(stream, &whole).await;
         }
@@ -263,13 +271,16 @@ async fn ranged(
         "range-lag" if hit == 1 => {
             send(stream, "206 Partial Content", &headers, b"").await?;
             let mut result = Ok(());
+            let pace = Pace::new(LAG_BYTES_PER_SECOND);
+            let mut sent = 0;
             for piece in slice.chunks(512) {
                 result = stream.write_all(piece).await;
                 if result.is_err() {
                     break;
                 }
                 let _ = stream.flush().await;
-                tokio::time::sleep(Duration::from_millis(40)).await;
+                sent += piece.len();
+                pace.wait(sent).await;
             }
             result
         }
@@ -304,21 +315,33 @@ async fn ranged(
             }
             result
         }
-        "range-slow" | "range-one" | "range-weak" if state.unthrottled.load(Ordering::SeqCst) == 0 => {
+        "range-slow" | "range-hold" | "range-one" | "range-weak" if state.unthrottled.load(Ordering::SeqCst) == 0 => {
             send(stream, "206 Partial Content", &headers, b"").await?;
             let mut result = Ok(());
             let last = slice.chunks(4096).count().saturating_sub(1);
+            let pace = Pace::new(SLOW_BYTES_PER_SECOND);
+            let mut sent = 0;
             for (index, piece) in slice.chunks(4096).enumerate() {
                 if route == "range-one" && index == last {
                     // Free the slot before the final bytes go out, so the client's next request cannot race it.
                     state.serving.fetch_sub(1, Ordering::SeqCst);
+                }
+                // Stop at 40% of the file until the test releases the server. A test that
+                // pauses or interrupts a download then never depends on how fast this computer is.
+                while route == "range-hold"
+                    && state.unthrottled.load(Ordering::SeqCst) == 0
+                    && state.held.load(Ordering::SeqCst) >= (n as u64) * 2 / 5
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 result = stream.write_all(piece).await;
                 if result.is_err() {
                     break;
                 }
                 let _ = stream.flush().await;
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                state.held.fetch_add(piece.len() as u64, Ordering::SeqCst);
+                sent += piece.len();
+                pace.wait(sent).await;
             }
             result
         }
@@ -329,12 +352,34 @@ async fn ranged(
 
 /// Sends `payload` in small pieces with a pause after each: a server that limits the speed of one connection.
 async fn trickle(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+    let pace = Pace::new(SLOW_BYTES_PER_SECOND);
+    let mut sent = 0;
     for piece in payload.chunks(4096) {
         stream.write_all(piece).await?;
         stream.flush().await?;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        sent += piece.len();
+        pace.wait(sent).await;
     }
     Ok(())
+}
+
+/// Holds one connection to a speed, measured against the clock. A pause of
+/// fixed length would give a different speed on each system, because timers
+/// differ in precision; waiting until a due time does not.
+struct Pace {
+    began: tokio::time::Instant,
+    bytes_per_second: f64,
+}
+
+impl Pace {
+    fn new(bytes_per_second: f64) -> Self {
+        Self { began: tokio::time::Instant::now(), bytes_per_second }
+    }
+
+    /// Waits until `sent` bytes are allowed to have left.
+    async fn wait(&self, sent: usize) {
+        tokio::time::sleep_until(self.began + Duration::from_secs_f64(sent as f64 / self.bytes_per_second)).await;
+    }
 }
 
 async fn send(stream: &mut TcpStream, status: &str, headers: Headers<'_>, payload: &[u8]) -> std::io::Result<()> {
